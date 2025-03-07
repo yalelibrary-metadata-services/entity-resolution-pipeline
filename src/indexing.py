@@ -1,10 +1,6 @@
 """
-Weaviate indexing module for entity resolution.
-
-This module provides the Indexer class, which handles the indexing of
-vector embeddings in Weaviate for efficient similarity search.
+Weaviate indexing module for large-scale entity resolution.
 """
-
 import os
 import logging
 import json
@@ -13,32 +9,32 @@ import uuid
 from pathlib import Path
 from tqdm import tqdm
 import weaviate
-from weaviate.classes.config import Configure, Property, DataType, VectorDistances, Tokenization
+from weaviate.classes.config import Configure, Property, DataType, VectorDistances
 from weaviate.classes.query import MetadataQuery, Filter
 from weaviate.util import generate_uuid5
 from tenacity import retry, stop_after_attempt, wait_exponential
+import numpy as np
+import pickle
 
-from src.utils import save_checkpoint, load_checkpoint, Timer, update_stage_metrics
+from src.utils import save_checkpoint, load_checkpoint, Timer, get_memory_usage
+from src.mmap_dict import MMapDict
 
 logger = logging.getLogger(__name__)
 
 class Indexer:
     """
-    Handles indexing of vector embeddings in Weaviate.
+    Handles indexing of vector embeddings in Weaviate for large datasets.
     
     Features:
-    - Creation of Weaviate schema
-    - Batch indexing of embeddings
-    - Named vector indexing for each field
-    - Checkpointing for resuming interrupted indexing
+    - Efficient schema optimization for vector search
+    - Batch indexing with automatic retries
+    - Support for named vectors by field type
+    - Idempotent operations for re-indexing
     """
     
     def __init__(self, config):
         """
         Initialize the indexer with configuration parameters.
-        
-        Args:
-            config (dict): Configuration parameters
         """
         self.config = config
         
@@ -59,46 +55,55 @@ class Indexer:
         self.ef_construction = config['weaviate']['ef_construction']
         self.distance_metric = config['weaviate']['distance_metric']
         
+        # Memory-mapped file paths
+        self.mmap_dir = Path(self.config['system']['temp_dir']) / "mmap"
+        
         logger.info("Indexer initialized with Weaviate at %s:%s", 
                    self.weaviate_host, self.weaviate_port)
 
     def execute(self, checkpoint=None):
         """
-        Execute indexing of embeddings in Weaviate.
-        
-        Args:
-            checkpoint (str, optional): Path to checkpoint file. Defaults to None.
-            
-        Returns:
-            dict: Indexing results
+        Execute indexing of embeddings in Weaviate with scalable approach.
         """
         # Load checkpoint if provided
         if checkpoint and os.path.exists(checkpoint):
             state = load_checkpoint(checkpoint)
             indexed_hashes = set(state.get('indexed_hashes', []))
-            logger.info("Resumed indexing from checkpoint: %s", checkpoint)
+            logger.info("Resumed indexing from checkpoint: %s with %d indexed hashes", 
+                       checkpoint, len(indexed_hashes))
         else:
             indexed_hashes = set()
         
-        # Check if collection exists, create if not
+        # Verify or create schema
         self._create_or_update_schema()
         
-        # Load embeddings and string data
-        embeddings, unique_strings, field_hash_mapping = self._load_data()
+        # Load embedded hashes and unique strings
+        embedded_hashes, unique_strings, field_hash_mapping = self._load_data()
         
-        # Filter embeddings that haven't been indexed yet
-        embeddings_to_index = {h: embeddings[h] for h in embeddings if h not in indexed_hashes}
+        # Filter hashes that haven't been indexed yet
+        hashes_to_index = [h for h in embedded_hashes if h not in indexed_hashes]
         
-        logger.info("Indexing %d/%d embeddings", len(embeddings_to_index), len(embeddings))
+        logger.info("Indexing %d/%d embedded hashes", 
+                   len(hashes_to_index), len(embedded_hashes))
         
         if self.config['system']['mode'] == 'dev':
-            # In dev mode, limit the number of embeddings to index
-            dev_sample_size = min(self.config['system']['dev_sample_size'], len(embeddings_to_index))
-            hash_sample = list(embeddings_to_index.keys())[:dev_sample_size]
-            embeddings_to_index = {h: embeddings_to_index[h] for h in hash_sample}
-            logger.info("Dev mode: limited to %d embeddings", len(embeddings_to_index))
+            # In dev mode, limit the number of hashes to index
+            dev_sample_size = min(self.config['system']['dev_sample_size'], len(hashes_to_index))
+            hashes_to_index = hashes_to_index[:dev_sample_size]
+            logger.info("Dev mode: limited to %d hashes", len(hashes_to_index))
         
-        # Index embeddings in batches
+        # Load embeddings
+        embeddings = self._load_embeddings()
+        
+        # Create batches of objects to index
+        batches = self._create_batches(
+            hashes_to_index, 
+            embeddings, 
+            unique_strings, 
+            field_hash_mapping
+        )
+        
+        # Index objects in batches
         total_indexed = 0
         batch_durations = []
         
@@ -108,37 +113,11 @@ class Indexer:
                 lambda: self.client.collections.get(self.collection_name)
             )
             
-            # Create batches of objects to index
-            batches = self._create_batches(embeddings_to_index, unique_strings, field_hash_mapping)
-            
             for batch_idx, batch in enumerate(tqdm(batches, desc="Indexing batches")):
                 batch_start = time.time()
                 try:
                     # Index batch
-                    with collection.batch.dynamic() as batch_executor:
-                        for obj in batch:
-                            # Generate UUID from hash
-                            obj_uuid = generate_uuid5(obj['hash'])
-                            
-                            # Prepare object properties (excluding vector)
-                            properties = {
-                                'hash': obj['hash'],
-                                'value': obj['value'],
-                                'field_type': obj['field_type'],
-                                'frequency': obj['frequency']
-                            }
-                            
-                            # Prepare vector
-                            vector = {
-                                obj['field_type']: obj['vector']
-                            }
-                            
-                            # Add object to batch
-                            batch_executor.add_object(
-                                properties=properties,
-                                uuid=obj_uuid,
-                                vector=vector
-                            )
+                    self._index_batch(collection, batch)
                     
                     # Update indexed hashes
                     batch_hashes = [obj['hash'] for obj in batch]
@@ -151,26 +130,23 @@ class Indexer:
                     
                     # Log progress
                     if (batch_idx + 1) % 10 == 0:
-                        logger.info("Indexed %d/%d batches, %d objects", 
-                                   batch_idx + 1, len(batches), total_indexed)
+                        logger.info("Indexed %d/%d batches, %d objects, %.2f seconds/batch", 
+                                   batch_idx + 1, len(batches), total_indexed, 
+                                   sum(batch_durations[-10:]) / 10)
+                        logger.info("Memory usage: %.2f GB", get_memory_usage())
                     
-                    # Save checkpoint
+                    # Save checkpoint periodically
                     if self.config['data']['checkpoints_enabled'] and (batch_idx + 1) % 50 == 0:
-                        checkpoint_path = Path(self.config['system']['checkpoint_dir']) / f"indexing_{batch_idx}.ckpt"
-                        save_checkpoint({
-                            'indexed_hashes': list(indexed_hashes)
-                        }, checkpoint_path)
+                        self._save_checkpoint(indexed_hashes, batch_idx)
                 
                 except Exception as e:
                     logger.error("Error indexing batch %d: %s", batch_idx, str(e))
                     
                     # Save checkpoint on error
-                    error_checkpoint = Path(self.config['system']['checkpoint_dir']) / f"indexing_error_{batch_idx}.ckpt"
-                    save_checkpoint({
-                        'indexed_hashes': list(indexed_hashes)
-                    }, error_checkpoint)
+                    self._save_checkpoint(indexed_hashes, f"error_{batch_idx}")
                     
-                    # Continue with next batch
+                    # Continue with next batch after a short delay
+                    time.sleep(5)
                     continue
         
         # Save final results
@@ -179,45 +155,40 @@ class Indexer:
         # Get collection statistics
         collection_stats = self._get_collection_stats()
         
+        # Calculate completion percentage
+        completion_pct = (len(indexed_hashes) / len(embedded_hashes)) * 100 if embedded_hashes else 0
+        
         results = {
             'objects_indexed': total_indexed,
+            'total_embedded': len(embedded_hashes),
+            'completion_percentage': completion_pct,
             'total_in_collection': collection_stats.get('object_count', 0),
             'duration': timer.duration,
             'batch_durations': batch_durations
         }
         
-        # Update monitoring metrics
-        update_stage_metrics('index', results)
-        
-        logger.info("Indexing completed: %d objects indexed in %.2f seconds",
-                   total_indexed, timer.duration)
+        logger.info("Indexing completed: %d objects indexed (%.2f%%), %.2f seconds",
+                   total_indexed, completion_pct, timer.duration)
         
         return results
 
     def _connect_to_weaviate(self):
         """
         Connect to Weaviate instance with retry logic.
-        
-        Returns:
-            weaviate.Client: Weaviate client
         """
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
         def connect_with_retry():
             try:
-                # Construct Weaviate connection URL
-                connection_url = f"http://{self.weaviate_host}:{self.weaviate_port}"
-                
                 # Connect to Weaviate
                 client = weaviate.connect_to_local(
-                    # host=self.weaviate_host,
-                    # port=self.weaviate_port,
-                    # grpc_port=None,  # Use default
-                    # headers={}
+                    host=self.weaviate_host,
+                    port=self.weaviate_port
                 )
                 
                 # Test connection
                 client.is_ready()
-                logger.info("Connected to Weaviate at %s", connection_url)
+                logger.info("Connected to Weaviate at %s:%s", 
+                           self.weaviate_host, self.weaviate_port)
                 
                 return client
             
@@ -231,12 +202,6 @@ class Indexer:
     def _execute_weaviate_operation(self, operation_func):
         """
         Execute a Weaviate operation with retry logic.
-        
-        Args:
-            operation_func (callable): Function to execute
-            
-        Returns:
-            Any: Result of the operation
         """
         try:
             return operation_func()
@@ -254,11 +219,22 @@ class Indexer:
                 lambda: self.client.collections.list_all()
             )
             
-            collection_exists = any(c == self.collection_name for c in collections)
+            collection_exists = self.collection_name in collections
             
             if collection_exists:
                 logger.info("Collection %s already exists", self.collection_name)
-                # TODO: Check if schema needs updates
+                
+                # Check if schema needs updates
+                collection = self._execute_weaviate_operation(
+                    lambda: self.client.collections.get(self.collection_name)
+                )
+                
+                # Check if properties exist and add missing ones
+                # This is a simplified version - in production you'd want
+                # to check property types and vector index settings too
+                
+                # For now, we'll just log that we're keeping the existing schema
+                logger.info("Using existing collection schema")
                 return
             
             # Create collection with named vectors
@@ -281,22 +257,32 @@ class Indexer:
             
             # Define properties
             properties = [
-                Property(name="hash", data_type=DataType.TEXT, index_filterable=True),
-                Property(name="value", data_type=DataType.TEXT, index_filterable=True, tokenization=Tokenization.FIELD),
-                Property(name="field_type", data_type=DataType.TEXT, index_filterable=True),
-                Property(name="frequency", data_type=DataType.NUMBER, index_filterable=True)
+                Property(name="hash", data_type=DataType.TEXT, index_filterable=True, 
+                         description="Hash of the text value"),
+                Property(name="value", data_type=DataType.TEXT, index_filterable=True, 
+                         description="Original text value"),
+                Property(name="field_type", data_type=DataType.TEXT, index_filterable=True, 
+                         description="Type of field (composite, person, title, etc.)"),
+                Property(name="frequency", data_type=DataType.NUMBER, index_filterable=True, 
+                         description="Frequency of occurrence in the dataset")
             ]
             
-            # Create collection
+            # Create collection with optimized settings
             self._execute_weaviate_operation(
                 lambda: self.client.collections.create(
                     name=self.collection_name,
+                    description="Entity resolution vectors collection",
                     vectorizer_config=vector_configs,
-                    properties=properties
+                    properties=properties,
+                    inverted_index_config={
+                        "indexTimestampPrecision": "s",  # Second-level precision is enough
+                        "stopwords": {"preset": "en"} 
+                    }
                 )
             )
             
-            logger.info("Created Weaviate collection: %s", self.collection_name)
+            logger.info("Created Weaviate collection: %s with optimized schema", 
+                       self.collection_name)
         
         except Exception as e:
             logger.error("Error creating Weaviate schema: %s", str(e))
@@ -304,86 +290,252 @@ class Indexer:
 
     def _load_data(self):
         """
-        Load embeddings and related data.
-        
-        Returns:
-            tuple: (embeddings, unique_strings, field_hash_mapping)
+        Load embedded hashes, unique strings, and field hash mapping.
         """
         try:
-            # Load embeddings from checkpoint
-            embedding_checkpoint = Path(self.config['system']['checkpoint_dir']) / "embedding_final.ckpt"
-            if os.path.exists(embedding_checkpoint):
-                embedding_state = load_checkpoint(embedding_checkpoint)
-                embeddings = embedding_state.get('embeddings', {})
+            # Load embedded hashes
+            output_dir = Path(self.config['system']['output_dir'])
+            
+            # Try to load from embedding index first
+            embedding_index_path = output_dir / "embedding_index.json"
+            if embedding_index_path.exists():
+                with open(embedding_index_path, 'r') as f:
+                    embedding_index = json.load(f)
+                
+                location = embedding_index.get('location')
+                
+                if location != "in-memory" and os.path.exists(location):
+                    # For large datasets, load hash arrays instead of full embeddings
+                    embedded_mmap = MMapDict(location)
+                    embedded_hashes = list(embedded_mmap.keys())
+                else:
+                    # Fall back to embedded_hashes.json
+                    with open(output_dir / "embedded_hashes.json", 'r') as f:
+                        embedded_hashes = json.load(f)
             else:
-                # Alternative: Load sample for development
-                output_dir = Path(self.config['system']['output_dir'])
-                with open(output_dir / "embeddings_sample.json", 'r') as f:
-                    embeddings = json.load(f)
+                # Fall back to embedded_hashes.json
+                with open(output_dir / "embedded_hashes.json", 'r') as f:
+                    embedded_hashes = json.load(f)
             
             # Load unique strings
-            output_dir = Path(self.config['system']['output_dir'])
-            with open(output_dir / "unique_strings_sample.json", 'r') as f:
-                unique_strings = json.load(f)
+            unique_strings_index_path = output_dir / "unique_strings_index.json"
+            if unique_strings_index_path.exists():
+                with open(unique_strings_index_path, 'r') as f:
+                    unique_strings_index = json.load(f)
+                
+                location = unique_strings_index.get('location')
+                
+                if location != "in-memory" and os.path.exists(location):
+                    # For large datasets, use memory-mapped dictionary
+                    unique_strings = MMapDict(location)
+                else:
+                    # Fall back to sample
+                    with open(output_dir / "unique_strings_sample.json", 'r') as f:
+                        unique_strings = json.load(f)
+            else:
+                # Fall back to sample
+                with open(output_dir / "unique_strings_sample.json", 'r') as f:
+                    unique_strings = json.load(f)
             
             # Load field hash mapping
-            with open(output_dir / "field_hash_mapping_sample.json", 'r') as f:
-                field_hash_mapping = json.load(f)
+            field_hash_index_path = output_dir / "field_hash_index.json"
+            if field_hash_index_path.exists():
+                with open(field_hash_index_path, 'r') as f:
+                    field_hash_index = json.load(f)
+                
+                location = field_hash_index.get('location')
+                
+                if location != "in-memory" and os.path.exists(location):
+                    # For large datasets, use memory-mapped dictionary
+                    field_hash_mapping = MMapDict(location)
+                else:
+                    # Fall back to sample
+                    with open(output_dir / "field_hash_mapping_sample.json", 'r') as f:
+                        field_hash_mapping = json.load(f)
+            else:
+                # Fall back to sample
+                with open(output_dir / "field_hash_mapping_sample.json", 'r') as f:
+                    field_hash_mapping = json.load(f)
             
-            logger.info("Loaded %d embeddings, %d unique strings, %d field mappings",
-                       len(embeddings), len(unique_strings), len(field_hash_mapping))
+            logger.info("Loaded %d embedded hashes, %d unique strings, %d field mappings",
+                       len(embedded_hashes), len(unique_strings), len(field_hash_mapping))
             
-            return embeddings, unique_strings, field_hash_mapping
+            return embedded_hashes, unique_strings, field_hash_mapping
         
         except Exception as e:
             logger.error("Error loading data: %s", str(e))
-            raise
+            return [], {}, {}
 
-    def _create_batches(self, embeddings, unique_strings, field_hash_mapping):
+    def _load_embeddings(self):
         """
-        Create batches of objects to index.
-        
-        Args:
-            embeddings (dict): Dictionary of hash -> embedding vector
-            unique_strings (dict): Dictionary of hash -> string value
-            field_hash_mapping (dict): Dictionary of hash -> {field -> count}
+        Load embeddings with support for memory-mapped storage.
+        """
+        try:
+            output_dir = Path(self.config['system']['output_dir'])
             
-        Returns:
-            list: List of batches, where each batch is a list of objects
+            # Try to load from embedding index first
+            embedding_index_path = output_dir / "embedding_index.json"
+            if embedding_index_path.exists():
+                with open(embedding_index_path, 'r') as f:
+                    embedding_index = json.load(f)
+                
+                location = embedding_index.get('location')
+                
+                if location != "in-memory" and os.path.exists(location):
+                    # For large datasets, use memory-mapped dictionary
+                    return MMapDict(location)
+            
+            # Try to load from embedding checkpoint
+            checkpoint_dir = Path(self.config['system']['checkpoint_dir'])
+            embedding_checkpoint = checkpoint_dir / "embedding_final.ckpt"
+            
+            if embedding_checkpoint.exists():
+                state = load_checkpoint(embedding_checkpoint)
+                if 'embeddings' in state:
+                    return state['embeddings']
+                elif 'embeddings_location' in state and os.path.exists(state['embeddings_location']):
+                    return MMapDict(state['embeddings_location'])
+            
+            # Fall back to embeddings_sample.json if it exists
+            embeddings_sample_path = output_dir / "embeddings_sample.json"
+            if embeddings_sample_path.exists():
+                with open(embeddings_sample_path, 'r') as f:
+                    return json.load(f)
+            
+            # If all else fails, return empty dict
+            logger.warning("Could not load embeddings, returning empty dictionary")
+            return {}
+        
+        except Exception as e:
+            logger.error("Error loading embeddings: %s", str(e))
+            return {}
+
+    def _create_batches(self, hashes, embeddings, unique_strings, field_hash_mapping):
+        """
+        Create batches of objects to index with optimized memory usage.
         """
         batch_size = self.batch_size
-        objects = []
+        batches = []
+        current_batch = []
         
-        # Prepare objects to index
-        for hash_value, vector in embeddings.items():
-            # Get string value
-            string_value = unique_strings.get(hash_value, "")
+        # Process in smaller chunks to avoid loading all embeddings at once
+        for i in range(0, len(hashes), 1000):
+            chunk_hashes = hashes[i:i+1000]
             
-            # Get field types and counts
-            field_types = field_hash_mapping.get(hash_value, {})
+            # Process each hash in the chunk
+            for hash_value in chunk_hashes:
+                # Skip if embedding is missing
+                if hash_value not in embeddings:
+                    logger.debug("Skipping hash %s: No embedding found", hash_value)
+                    continue
+                
+                # Skip if not in unique strings (shouldn't happen but check anyway)
+                if hash_value not in unique_strings:
+                    logger.debug("Skipping hash %s: No unique string found", hash_value)
+                    continue
+                
+                # Skip if not in field hash mapping
+                if hash_value not in field_hash_mapping:
+                    logger.debug("Skipping hash %s: No field mapping found", hash_value)
+                    continue
+                
+                # Get string value and embedding
+                string_value = unique_strings[hash_value]
+                embedding_vector = embeddings[hash_value]
+                
+                # Get field types and counts
+                field_types = field_hash_mapping[hash_value]
+                
+                # Calculate total frequency
+                total_frequency = sum(field_types.values())
+                
+                # Create an object for each field type
+                for field_type, count in field_types.items():
+                    obj = {
+                        'hash': hash_value,
+                        'value': string_value,
+                        'field_type': field_type,
+                        'frequency': count,
+                        'vector': embedding_vector
+                    }
+                    
+                    current_batch.append(obj)
+                    
+                    # If batch is full, add to batches and start a new one
+                    if len(current_batch) >= batch_size:
+                        batches.append(current_batch)
+                        current_batch = []
             
-            # Calculate total frequency
-            total_frequency = sum(field_types.values())
-            
-            # Create an object for each field type
-            for field_type, count in field_types.items():
-                objects.append({
-                    'hash': hash_value,
-                    'value': string_value,
-                    'field_type': field_type,
-                    'frequency': count,
-                    'vector': vector
-                })
+            # Log progress
+            logger.debug("Processed %d/%d hashes, created %d batches", 
+                        i + len(chunk_hashes), len(hashes), len(batches))
         
-        # Create batches
-        return [objects[i:i + batch_size] for i in range(0, len(objects), batch_size)]
+        # Add last batch if not empty
+        if current_batch:
+            batches.append(current_batch)
+        
+        return batches
+
+    def _index_batch(self, collection, batch):
+        """
+        Index a batch of objects in Weaviate with batching and error handling.
+        """
+        try:
+            # Use Weaviate's batch import
+            with collection.batch.dynamic() as batch_executor:
+                for obj in batch:
+                    # Generate UUID from hash and field type for idempotency
+                    # This ensures that re-running the indexing won't create duplicates
+                    obj_uuid = generate_uuid5(f"{obj['hash']}_{obj['field_type']}")
+                    
+                    # Prepare object properties (excluding vector)
+                    properties = {
+                        'hash': obj['hash'],
+                        'value': obj['value'],
+                        'field_type': obj['field_type'],
+                        'frequency': obj['frequency']
+                    }
+                    
+                    # Prepare vector
+                    vector = {
+                        obj['field_type']: obj['vector']
+                    }
+                    
+                    # Add object to batch
+                    batch_executor.add_object(
+                        properties=properties,
+                        uuid=obj_uuid,
+                        vector=vector
+                    )
+        
+        except Exception as e:
+            logger.error("Error indexing batch: %s", str(e))
+            raise
+
+    def _save_checkpoint(self, indexed_hashes, batch_idx):
+        """
+        Save checkpoint for indexing progress.
+        """
+        try:
+            checkpoint_dir = Path(self.config['system']['checkpoint_dir'])
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            
+            checkpoint_path = checkpoint_dir / f"indexing_{batch_idx}.ckpt"
+            
+            # Save checkpoint
+            save_checkpoint({
+                'indexed_hashes': list(indexed_hashes)
+            }, checkpoint_path)
+            
+            logger.info("Saved indexing checkpoint at %s with %d indexed hashes", 
+                       checkpoint_path, len(indexed_hashes))
+        
+        except Exception as e:
+            logger.error("Error saving checkpoint: %s", str(e))
 
     def _get_collection_stats(self):
         """
         Get statistics for the Weaviate collection.
-        
-        Returns:
-            dict: Collection statistics
         """
         try:
             collection = self._execute_weaviate_operation(
@@ -423,42 +575,48 @@ class Indexer:
     def _save_results(self, indexed_hashes):
         """
         Save indexing results.
-        
-        Args:
-            indexed_hashes (set): Set of indexed hash values
         """
         output_dir = Path(self.config['system']['output_dir'])
         output_dir.mkdir(exist_ok=True, parents=True)
         
-        # Save list of indexed hashes
+        # Save list of indexed hashes (up to 10,000 for reference)
+        sample_hashes = list(indexed_hashes)[:10000]
         with open(output_dir / "indexed_hashes.json", 'w') as f:
-            json.dump(list(indexed_hashes), f)
+            json.dump(sample_hashes, f)
         
         # Save collection statistics
         stats = self._get_collection_stats()
         with open(output_dir / "collection_statistics.json", 'w') as f:
             json.dump(stats, f, indent=2)
         
+        # Save indexing metadata
+        indexing_metadata = {
+            'collection_name': self.collection_name,
+            'indexed_count': len(indexed_hashes),
+            'collection_count': stats.get('object_count', 0),
+            'field_distribution': stats.get('field_counts', {}),
+            'index_parameters': {
+                'ef': self.ef,
+                'max_connections': self.max_connections,
+                'ef_construction': self.ef_construction,
+                'distance_metric': self.distance_metric
+            }
+        }
+        
+        with open(output_dir / "indexing_metadata.json", 'w') as f:
+            json.dump(indexing_metadata, f, indent=2)
+        
         # Save final checkpoint
         checkpoint_path = Path(self.config['system']['checkpoint_dir']) / "indexing_final.ckpt"
         save_checkpoint({
-            'indexed_hashes': list(indexed_hashes)
+            'indexed_hashes': list(indexed_hashes)[:100000]  # Limit to 100K for checkpoint size
         }, checkpoint_path)
         
         logger.info("Indexing results saved to %s", output_dir)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def search_by_vector(self, vector, field_type, limit=10):
+    def search_by_vector(self, vector, field_type, limit=100, threshold=0.7):
         """
         Search for similar objects by vector.
-        
-        Args:
-            vector (list): Query vector
-            field_type (str): Field type to search
-            limit (int, optional): Maximum number of results. Defaults to 10.
-            
-        Returns:
-            list: Search results
         """
         try:
             collection = self.client.collections.get(self.collection_name)
@@ -475,60 +633,80 @@ class Indexer:
                 include_vector=True
             )
             
-            return results.objects
+            # Filter by threshold
+            filtered_results = []
+            for obj in results.objects:
+                similarity = 1.0 - obj.metadata.distance
+                if similarity >= threshold:
+                    filtered_results.append({
+                        'hash': obj.properties.get('hash'),
+                        'value': obj.properties.get('value'),
+                        'field_type': obj.properties.get('field_type'),
+                        'similarity': similarity,
+                        'vector': obj.vector.get(field_type) if obj.vector else None
+                    })
+            
+            return filtered_results
         
         except Exception as e:
             logger.error("Error searching by vector: %s", str(e))
-            raise
+            return []
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def search_by_hash(self, hash_value, field_type=None):
+    def verify_index_consistency(self):
         """
-        Search for objects by hash value.
-        
-        Args:
-            hash_value (str): Hash value to search for
-            field_type (str, optional): Field type to filter by. Defaults to None.
-            
-        Returns:
-            list: Search results
+        Verify consistency between indexed objects and embeddings.
         """
         try:
+            # Load embedded and indexed hashes
+            output_dir = Path(self.config['system']['output_dir'])
+            
+            with open(output_dir / "embedded_hashes.json", 'r') as f:
+                embedded_hashes = json.load(f)
+            
+            with open(output_dir / "indexed_hashes.json", 'r') as f:
+                indexed_hashes = json.load(f)
+            
+            # Get collection statistics
             collection = self.client.collections.get(self.collection_name)
+            count_result = collection.aggregate.over_all(total_count=True)
             
-            # Create filter for hash
-            if field_type:
-                # Filter by hash and field type
-                hash_filter = Filter.by_property("hash").equal(hash_value)
-                field_filter = Filter.by_property("field_type").equal(field_type)
-                combined_filter = Filter.all_of([hash_filter, field_filter])
-                filter_obj = combined_filter
-            else:
-                # Filter by hash only
-                filter_obj = Filter.by_property("hash").equal(hash_value)
+            # Calculate metrics
+            embedded_count = len(embedded_hashes)
+            indexed_count = len(indexed_hashes)
+            collection_count = count_result.total_count
             
-            # Execute search
-            results = collection.query.fetch_objects(
-                filters=filter_obj,
-                limit=10,
-                include_vector=True
-            )
+            # Note: collection_count should be higher than indexed_count
+            # because we create multiple objects per hash (one per field type)
             
-            return results.objects
+            missing_count = embedded_count - indexed_count
+            
+            consistency_check = {
+                'embedded_count': embedded_count,
+                'indexed_count': indexed_count,
+                'collection_count': collection_count,
+                'missing_count': missing_count,
+                'missing_percentage': (missing_count / embedded_count * 100) if embedded_count > 0 else 0,
+                'is_consistent': missing_count == 0
+            }
+            
+            return consistency_check
         
         except Exception as e:
-            logger.error("Error searching by hash: %s", str(e))
-            raise
+            logger.error("Error verifying index consistency: %s", str(e))
+            return {
+                'error': str(e),
+                'is_consistent': False
+            }
 
     def __del__(self):
         """
-        Cleanup resources when object is garbage collected.
+        Clean up resources when object is garbage collected.
         """
         try:
             # Close Weaviate client if it exists
             if hasattr(self, 'client') and self.client:
                 logger.debug("Closing Weaviate client connection")
-                self.client.close()  # Properly close the client
-                self.client = None   # Then set to None
+                self.client.close()
+                self.client = None
         except Exception as e:
-            logger.error(f"Error closing Weaviate client: {e}")
+            logger.error("Error closing Weaviate client: %s", str(e))

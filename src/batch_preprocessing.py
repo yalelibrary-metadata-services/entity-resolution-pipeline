@@ -1,13 +1,8 @@
 """
-Batch preprocessing module for entity resolution.
-
-This module provides the Preprocessor class, which handles data preprocessing
-tasks such as normalization, extraction, and deduplication of text fields.
+Enhanced preprocessing module for large-scale entity resolution.
 """
-
 import os
 import logging
-import csv
 import json
 import hashlib
 import re
@@ -18,6 +13,7 @@ import mmh3
 from tqdm import tqdm
 import numpy as np
 from src.mmap_dict import MMapDict
+import pickle
 
 from src.utils import save_checkpoint, load_checkpoint, get_memory_usage
 from src.birth_death_regexes import BirthDeathYearExtractor
@@ -26,63 +22,69 @@ logger = logging.getLogger(__name__)
 
 class Preprocessor:
     """
-    Handles preprocessing of data for entity resolution.
-    
-    Preprocessing tasks include:
-    - Reading CSV files
-    - Normalizing text fields
-    - Extracting and deduplicating fields
-    - Maintaining hash-based data structures
-    - Tracking frequency of duplicate strings
+    Enhanced preprocessor for large-scale entity resolution.
     """
     
     def __init__(self, config):
         """
         Initialize the preprocessor with configuration parameters.
-        
-        Args:
-            config (dict): Configuration parameters
         """
         self.config = config
         self.birth_death_extractor = BirthDeathYearExtractor()
         
-        # Initialize data structures
-        self.unique_strings = {}  # Hash -> string value
-        self.string_counts = {}   # Hash -> count of occurrences
-        self.record_field_hashes = {}  # Record ID -> {field -> hash}
-        self.field_hash_mapping = {}   # Hash -> {field1: count1, field2: count2, ...}
+        # Determine storage approach based on dataset size and mode
+        self.use_mmap = self.config['system']['mode'] == 'prod'
+        self.mmap_dir = Path(self.config['system']['temp_dir']) / "mmap"
+        self.mmap_dir.mkdir(exist_ok=True, parents=True)
         
-        # Use memory-mapped dictionaries for large datasets in production mode
-        if self.config['system']['mode'] == 'prod':
-            self.use_mmap = True
-            self.mmap_dir = Path(self.config['system']['temp_dir']) / "mmap"
-            self.mmap_dir.mkdir(exist_ok=True, parents=True)
-            
-            # Initialize memory-mapped dictionaries
+        # Initialize data structures
+        self._initialize_storage()
+        
+        logger.info("Preprocessor initialized with mode: %s, using %s storage", 
+                   self.config['system']['mode'], 
+                   "memory-mapped" if self.use_mmap else "in-memory")
+
+    def _initialize_storage(self):
+        """
+        Initialize storage based on configuration.
+        """
+        if self.use_mmap:
+            # Use memory-mapped dictionaries for large datasets
             self.unique_strings = MMapDict(self.mmap_dir / "unique_strings.mmap")
             self.string_counts = MMapDict(self.mmap_dir / "string_counts.mmap")
+            self.record_field_hashes = MMapDict(self.mmap_dir / "record_field_hashes.mmap")
+            self.field_hash_mapping = MMapDict(self.mmap_dir / "field_hash_mapping.mmap")
         else:
-            self.use_mmap = False
-        
-        logger.info("Preprocessor initialized with mode: %s", self.config['system']['mode'])
+            # Use in-memory dictionaries for small datasets
+            self.unique_strings = {}
+            self.string_counts = {}
+            self.record_field_hashes = {}
+            self.field_hash_mapping = {}
 
     def execute(self, checkpoint=None):
         """
-        Execute preprocessing tasks.
-        
-        Args:
-            checkpoint (str, optional): Path to checkpoint file. Defaults to None.
-            
-        Returns:
-            dict: Preprocessing results
+        Execute preprocessing tasks with scalable approach.
         """
         # Load checkpoint if provided
         if checkpoint and os.path.exists(checkpoint):
             state = load_checkpoint(checkpoint)
-            self.unique_strings = state.get('unique_strings', {})
-            self.string_counts = state.get('string_counts', {})
-            self.record_field_hashes = state.get('record_field_hashes', {})
-            self.field_hash_mapping = state.get('field_hash_mapping', {})
+            if self.use_mmap:
+                # For memory-mapped storage, we need to load the data
+                for key, value in state.get('unique_strings', {}).items():
+                    self.unique_strings[key] = value
+                for key, value in state.get('string_counts', {}).items():
+                    self.string_counts[key] = value
+                for key, value in state.get('record_field_hashes', {}).items():
+                    self.record_field_hashes[key] = value
+                for key, value in state.get('field_hash_mapping', {}).items():
+                    self.field_hash_mapping[key] = value
+            else:
+                # For in-memory storage, we can directly assign
+                self.unique_strings = state.get('unique_strings', {})
+                self.string_counts = state.get('string_counts', {})
+                self.record_field_hashes = state.get('record_field_hashes', {})
+                self.field_hash_mapping = state.get('field_hash_mapping', {})
+            
             processed_files = state.get('processed_files', [])
             logger.info("Resumed preprocessing from checkpoint: %s", checkpoint)
         else:
@@ -124,22 +126,45 @@ class Preprocessor:
                 total_records += len(records)
                 processed_files.append(input_file.name)
                 
-                # Save checkpoint
-                if self.config['data']['checkpoints_enabled']:
-                    checkpoint_path = Path(self.config['system']['checkpoint_dir']) / f"preprocess_{input_file.stem}.ckpt"
-                    save_checkpoint({
-                        'unique_strings': self.unique_strings,
-                        'string_counts': self.string_counts,
-                        'record_field_hashes': self.record_field_hashes,
-                        'field_hash_mapping': self.field_hash_mapping,
-                        'processed_files': processed_files
-                    }, checkpoint_path)
+                # Save checkpoint with progress information
+                if self.config['data']['checkpoints_enabled'] and (len(processed_files) % 5 == 0 or len(processed_files) == len(input_files)):
+                    checkpoint_path = Path(self.config['system']['checkpoint_dir']) / f"preprocess_{len(processed_files)}files.ckpt"
+                    
+                    # For memory-mapped storage, we create a lightweight checkpoint
+                    # that only contains the processed files and statistics
+                    if self.use_mmap:
+                        # Flush memory-mapped dictionaries
+                        self.unique_strings.flush()
+                        self.string_counts.flush()
+                        self.record_field_hashes.flush()
+                        self.field_hash_mapping.flush()
+                        
+                        # Create lightweight checkpoint
+                        lightweight_checkpoint = {
+                            'processed_files': processed_files,
+                            'stats': {
+                                'unique_strings': len(self.unique_strings),
+                                'records': len(self.record_field_hashes)
+                            }
+                        }
+                        save_checkpoint(lightweight_checkpoint, checkpoint_path)
+                    else:
+                        # Create full checkpoint
+                        save_checkpoint({
+                            'unique_strings': self.unique_strings,
+                            'string_counts': self.string_counts,
+                            'record_field_hashes': self.record_field_hashes,
+                            'field_hash_mapping': self.field_hash_mapping,
+                            'processed_files': processed_files
+                        }, checkpoint_path)
                 
-                logger.info("Processed file: %s, records: %d", input_file.name, len(records))
+                logger.info("Processed file: %s, records: %d, unique strings: %d", 
+                          input_file.name, len(records), len(self.unique_strings))
                 logger.info("Memory usage: %.2f GB", get_memory_usage())
         
-        # Save final results
+        # Save final results and create necessary index files
         self._save_results()
+        self._create_lookup_tables()
         
         results = {
             'records_processed': total_records,
@@ -155,13 +180,6 @@ class Preprocessor:
     def _read_file_in_batches(self, file_path, batch_size):
         """
         Read CSV file in efficient batches using pandas.
-        
-        Args:
-            file_path (Path): Path to CSV file
-            batch_size (int): Number of records per batch
-            
-        Yields:
-            list: Batch of records
         """
         try:
             # Use pandas with chunking for more efficient reading
@@ -177,12 +195,6 @@ class Preprocessor:
     def _process_batch(self, batch):
         """
         Process a batch of records.
-        
-        Args:
-            batch (list): List of record dictionaries
-            
-        Returns:
-            dict: Processed batch data
         """
         batch_unique_strings = {}
         batch_string_counts = {}
@@ -209,7 +221,7 @@ class Preprocessor:
                 # Normalize value
                 normalized_value = self._normalize_text(value)
                 
-                # Generate hash
+                # Generate hash - use MurmurHash for better performance
                 value_hash = self._hash_string(normalized_value)
                 field_hashes[field] = value_hash
                 
@@ -241,9 +253,6 @@ class Preprocessor:
     def _update_data_structures(self, batch_data):
         """
         Update data structures with batch results.
-        
-        Args:
-            batch_data (dict): Processed batch data
         """
         # Update unique strings
         for value_hash, value in batch_data['unique_strings'].items():
@@ -271,12 +280,6 @@ class Preprocessor:
     def _normalize_text(self, text):
         """
         Normalize text value.
-        
-        Args:
-            text: Value to normalize (could be string, float, int, etc.)
-            
-        Returns:
-            str: Normalized text
         """
         if text is None:
             return ""
@@ -295,45 +298,150 @@ class Preprocessor:
 
     def _hash_string(self, text):
         """
-        Generate hash for a string.
-        
-        Args:
-            text (str): String to hash
-            
-        Returns:
-            str: Hash value
+        Generate hash for a string using MurmurHash for better performance.
         """
-        # Using MD5 for consistency and to avoid collisions
-        return hashlib.md5(text.encode('utf-8')).hexdigest()
+        # MurmurHash is much faster than MD5/SHA and has low collision rate
+        return str(mmh3.hash128(text))
 
     def _save_results(self):
         """
-        Save preprocessing results to disk.
+        Save preprocessing results in a scalable way.
         """
         output_dir = Path(self.config['system']['output_dir'])
         output_dir.mkdir(exist_ok=True, parents=True)
         
-        # Save unique strings sample (first 1000)
-        unique_strings_sample = {k: self.unique_strings[k] for k in list(self.unique_strings)[:1000]}
+        # Create a lightweight index file that contains references
+        # to memory-mapped data rather than copying everything
+        
+        # Save unique strings index
+        unique_strings_index = {
+            'count': len(self.unique_strings),
+            'location': str(self.mmap_dir / "unique_strings.mmap") if self.use_mmap else "in-memory",
+            'sample': {k: self.unique_strings[k] for k in list(self.unique_strings.keys())[:100]}
+        }
+        with open(output_dir / "unique_strings_index.json", 'w') as f:
+            json.dump(unique_strings_index, f)
+        
+        # Save string counts index
+        string_counts_index = {
+            'count': len(self.string_counts),
+            'location': str(self.mmap_dir / "string_counts.mmap") if self.use_mmap else "in-memory",
+            'sample': {k: self.string_counts[k] for k in list(self.string_counts.keys())[:100]}
+        }
+        with open(output_dir / "string_counts_index.json", 'w') as f:
+            json.dump(string_counts_index, f)
+        
+        # Save record field hashes index
+        record_index = {
+            'count': len(self.record_field_hashes),
+            'location': str(self.mmap_dir / "record_field_hashes.mmap") if self.use_mmap else "in-memory",
+            'sample': {k: self.record_field_hashes[k] for k in list(self.record_field_hashes.keys())[:100]}
+        }
+        with open(output_dir / "record_index.json", 'w') as f:
+            json.dump(record_index, f)
+        
+        # Save field hash mapping index
+        field_hash_index = {
+            'count': len(self.field_hash_mapping),
+            'location': str(self.mmap_dir / "field_hash_mapping.mmap") if self.use_mmap else "in-memory",
+            'sample': {k: self.field_hash_mapping[k] for k in list(self.field_hash_mapping.keys())[:100]}
+        }
+        with open(output_dir / "field_hash_index.json", 'w') as f:
+            json.dump(field_hash_index, f)
+        
+        # Additionally, save full samples for compatibility with downstream components
+        # that expect these files
+        unique_strings_sample = {k: self.unique_strings[k] for k in list(self.unique_strings.keys())[:1000]}
         with open(output_dir / "unique_strings_sample.json", 'w') as f:
-            json.dump(unique_strings_sample, f, indent=2)
+            json.dump(unique_strings_sample, f)
         
-        # Save string counts sample
-        string_counts_sample = {k: self.string_counts[k] for k in list(self.string_counts)[:1000]}
+        string_counts_sample = {k: self.string_counts[k] for k in list(self.string_counts.keys())[:1000]}
         with open(output_dir / "string_counts_sample.json", 'w') as f:
-            json.dump(string_counts_sample, f, indent=2)
+            json.dump(string_counts_sample, f)
         
-        # Save field hash mapping sample
-        field_hash_mapping_sample = {k: self.field_hash_mapping[k] for k in list(self.field_hash_mapping)[:1000]}
+        field_hash_mapping_sample = {k: self.field_hash_mapping[k] for k in list(self.field_hash_mapping.keys())[:1000]}
         with open(output_dir / "field_hash_mapping_sample.json", 'w') as f:
-            json.dump(field_hash_mapping_sample, f, indent=2)
+            json.dump(field_hash_mapping_sample, f)
         
-        # Save record field hashes sample
-        record_field_hashes_sample = {k: self.record_field_hashes[k] for k in list(self.record_field_hashes)[:1000]}
+        record_field_hashes_sample = {k: self.record_field_hashes[k] for k in list(self.record_field_hashes.keys())[:1000]}
         with open(output_dir / "record_field_hashes_sample.json", 'w') as f:
-            json.dump(record_field_hashes_sample, f, indent=2)
+            json.dump(record_field_hashes_sample, f)
         
-        # Save statistics
+        # For large datasets, create a memory-mapped numpy array to store the hashes
+        # This will allow efficient access to the hashes for embedding
+        if self.use_mmap and len(self.unique_strings) > 10000:
+            self._create_hash_array()
+        
+        # Flush memory-mapped dictionaries
+        if self.use_mmap:
+            self.unique_strings.flush()
+            self.string_counts.flush()
+            self.record_field_hashes.flush()
+            self.field_hash_mapping.flush()
+        
+        logger.info("Preprocessing results saved to %s", output_dir)
+
+    def _create_hash_array(self):
+        """
+        Create a memory-mapped array of hashes for efficient access.
+        """
+        hash_array_path = self.mmap_dir / "hash_array.npy"
+        
+        # Get list of hashes
+        hashes = list(self.unique_strings.keys())
+        
+        # Create memory-mapped array
+        hash_array = np.memmap(
+            hash_array_path, 
+            dtype='U64',  # Unicode string of max length 64
+            mode='w+',
+            shape=(len(hashes),)
+        )
+        
+        # Fill array with hashes
+        for i, hash_value in enumerate(hashes):
+            hash_array[i] = hash_value
+        
+        # Flush to disk
+        hash_array.flush()
+        
+        # Save index mapping
+        hash_to_index = {hash_value: i for i, hash_value in enumerate(hashes)}
+        
+        with open(self.mmap_dir / "hash_to_index.pkl", 'wb') as f:
+            pickle.dump(hash_to_index, f)
+        
+        logger.info("Created hash array with %d hashes", len(hashes))
+
+    def _create_lookup_tables(self):
+        """
+        Create lookup tables for efficient access.
+        """
+        output_dir = Path(self.config['system']['output_dir'])
+        
+        # Create personId -> field hash lookup table
+        person_id_lookup = {}
+        
+        for record_id, field_hashes in self.record_field_hashes.items():
+            person_hash = field_hashes.get('person', 'NULL')
+            if person_hash != 'NULL':
+                person_id_lookup[record_id] = person_hash
+        
+        with open(output_dir / "person_id_lookup.json", 'w') as f:
+            # For large datasets, save only a sample
+            if len(person_id_lookup) > 10000 and self.use_mmap:
+                sample = {k: person_id_lookup[k] for k in list(person_id_lookup.keys())[:10000]}
+                json.dump(sample, f)
+                
+                # Save full lookup to memory-mapped file
+                person_id_mmap = MMapDict(self.mmap_dir / "person_id_lookup.mmap")
+                for k, v in person_id_lookup.items():
+                    person_id_mmap[k] = v
+                person_id_mmap.flush()
+            else:
+                json.dump(person_id_lookup, f)
+        
+        # Create field statistics for analysis
         field_stats = {}
         for value_hash, field_counts in self.field_hash_mapping.items():
             for field, count in field_counts.items():
@@ -349,21 +457,27 @@ class Preprocessor:
         with open(output_dir / "field_statistics.json", 'w') as f:
             json.dump(field_stats, f, indent=2)
         
-        # If using memory-mapped dictionaries, make sure they're fully flushed
+        logger.info("Created lookup tables and statistics")
+
+    def get_hash_array(self):
+        """
+        Get memory-mapped hash array for efficient access.
+        """
         if self.use_mmap:
-            self.unique_strings.flush()
-            self.string_counts.flush()
+            hash_array_path = self.mmap_dir / "hash_array.npy"
+            if hash_array_path.exists():
+                return np.memmap(
+                    hash_array_path,
+                    dtype='U64',
+                    mode='r',
+                    shape=(len(self.unique_strings),)
+                )
         
-        logger.info("Preprocessing results saved to %s", output_dir)
+        # Fallback to list for in-memory mode
+        return list(self.unique_strings.keys())
 
     def get_birth_death_years(self, person_name):
         """
         Extract birth and death years from a person name string.
-        
-        Args:
-            person_name (str): Person name string
-            
-        Returns:
-            tuple: (birth_year, death_year) or (None, None) if not found
         """
         return self.birth_death_extractor.parse(person_name)

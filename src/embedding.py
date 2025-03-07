@@ -1,42 +1,38 @@
 """
-Vector embedding module for entity resolution.
-
-This module provides the Embedder class, which handles the generation of
-vector embeddings for unique strings using OpenAI's text-embedding model.
+Scalable vector embedding module for large-scale entity resolution.
 """
-
 import os
 import logging
 import json
 import time
+import pickle
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import openai
 from tenacity import retry, stop_after_attempt, wait_exponential
+import mmh3
 
 from src.utils import save_checkpoint, load_checkpoint, get_memory_usage, Timer
+from src.mmap_dict import MMapDict
 
 logger = logging.getLogger(__name__)
 
 class Embedder:
     """
-    Handles generation of vector embeddings for unique strings.
+    Handles generation of vector embeddings for large datasets.
     
     Features:
-    - Batched embedding requests for efficiency
-    - Rate limiting to respect API constraints
-    - Checkpointing for resuming interrupted embedding
-    - Caching of embeddings to avoid redundant API calls
+    - Scalable approach for millions of strings
+    - Memory-mapped storage for embeddings
+    - Efficient batching and rate limiting
+    - Robust error handling and retry logic
     """
     
     def __init__(self, config):
         """
         Initialize the embedder with configuration parameters.
-        
-        Args:
-            config (dict): Configuration parameters
         """
         self.config = config
         
@@ -57,67 +53,121 @@ class Embedder:
         self.rpm_limit = config['embedding']['rpm_limit']
         self.tpm_limit = config['embedding']['tpm_limit']
         
+        # Determine storage approach based on dataset size and mode
+        self.use_mmap = self.config['system']['mode'] == 'prod'
+        self.mmap_dir = Path(self.config['system']['temp_dir']) / "mmap"
+        self.mmap_dir.mkdir(exist_ok=True, parents=True)
+        
         # Initialize embeddings cache
-        self.embeddings = {}
+        self._initialize_storage()
         
         # Rate limiting state
         self.request_timestamps = []
         self.token_counts = []
         
-        logger.info("Embedder initialized with model: %s", self.model)
+        logger.info("Embedder initialized with model: %s, using %s storage", 
+                   self.model,
+                   "memory-mapped" if self.use_mmap else "in-memory")
+
+    def _initialize_storage(self):
+        """
+        Initialize storage based on configuration.
+        """
+        if self.use_mmap:
+            # Use memory-mapped dictionary for embeddings
+            self.embeddings = MMapDict(self.mmap_dir / "embeddings.mmap")
+        else:
+            # Use in-memory dictionary for small datasets
+            self.embeddings = {}
 
     def execute(self, checkpoint=None):
         """
-        Execute embedding generation for unique strings.
-        
-        Args:
-            checkpoint (str, optional): Path to checkpoint file. Defaults to None.
-            
-        Returns:
-            dict: Embedding results
+        Execute embedding generation for large datasets.
         """
         # Load checkpoint if provided
         if checkpoint and os.path.exists(checkpoint):
             state = load_checkpoint(checkpoint)
-            self.embeddings = state.get('embeddings', {})
+            
+            # For memory-mapped storage, we need to merge the embeddings
+            if self.use_mmap:
+                for hash_value, embedding in state.get('embeddings', {}).items():
+                    self.embeddings[hash_value] = embedding
+            else:
+                # For in-memory storage, we can directly assign
+                self.embeddings = state.get('embeddings', {})
+            
             processed_hashes = set(state.get('processed_hashes', []))
-            logger.info("Resumed embedding from checkpoint: %s", checkpoint)
+            
+            # Load rate limiting state
+            self.request_timestamps = state.get('request_timestamps', [])
+            self.token_counts = state.get('token_counts', [])
+            
+            logger.info("Resumed embedding from checkpoint: %s with %d processed hashes", 
+                       checkpoint, len(processed_hashes))
         else:
             processed_hashes = set()
         
-        # Load unique strings from preprocessing results
-        unique_strings = self._load_unique_strings()
+        # Load hash array or unique strings
+        # This approach supports both the enhanced preprocessor and the original one
+        hash_array_path = self.mmap_dir / "hash_array.npy"
+        if self.use_mmap and hash_array_path.exists():
+            # Use memory-mapped hash array for efficient access
+            hash_array = np.memmap(
+                hash_array_path,
+                dtype='U64',
+                mode='r'
+            )
+            all_hashes = [hash_array[i] for i in range(len(hash_array))]
+            logger.info("Loaded %d hashes from memory-mapped array", len(all_hashes))
+        else:
+            # Fall back to loading unique strings from file or index
+            unique_strings = self._load_unique_strings()
+            all_hashes = list(unique_strings.keys())
+            logger.info("Loaded %d hashes from unique strings", len(all_hashes))
         
-        # Filter fields to embed
-        fields_to_embed = self.config['embedding']['fields_to_embed']
+        # Filter hashes that haven't been processed yet
+        hashes_to_process = [h for h in all_hashes if h not in processed_hashes]
         
         # Load field hash mapping to identify field types
         field_hash_mapping = self._load_field_hash_mapping()
         
         # Filter strings to embed
+        fields_to_embed = self.config['embedding']['fields_to_embed']
         strings_to_embed = {}
-        for hash_value, string_value in unique_strings.items():
+        
+        logger.info("Filtering %d hashes to find strings to embed", len(hashes_to_process))
+        
+        for hash_value in tqdm(hashes_to_process, desc="Filtering strings"):
             # Skip if already processed
             if hash_value in processed_hashes:
                 continue
             
-            # Skip if not in field hash mapping (shouldn't happen)
-            if hash_value not in field_hash_mapping:
-                logger.warning("Hash %s not found in field hash mapping", hash_value)
-                continue
-            
-            # Check if any field type is in fields_to_embed
-            field_types = field_hash_mapping[hash_value].keys()
-            if any(field in fields_to_embed for field in field_types):
-                strings_to_embed[hash_value] = string_value
+            # Look up in field hash mapping
+            if hash_value in field_hash_mapping:
+                field_types = field_hash_mapping[hash_value].keys()
+                if any(field in fields_to_embed for field in field_types):
+                    # Get the string value from unique strings
+                    if self.use_mmap:
+                        unique_strings_mmap = MMapDict(self.mmap_dir / "unique_strings.mmap")
+                        if hash_value in unique_strings_mmap:
+                            strings_to_embed[hash_value] = unique_strings_mmap[hash_value]
+                    else:
+                        # For small datasets, we've already loaded unique_strings
+                        if hash_value in unique_strings:
+                            strings_to_embed[hash_value] = unique_strings[hash_value]
         
-        logger.info("Embedding %d/%d unique strings", len(strings_to_embed), len(unique_strings))
+        # Log detailed filtering results
+        skipped_count = len(hashes_to_process) - len(strings_to_embed)
+        logger.info("Filtered %d/%d strings for embedding", len(strings_to_embed), len(hashes_to_process))
+        logger.info("Skipped %d strings during filtering:", skipped_count)
+        logger.info("  - Already processed: %d", len(all_hashes) - len(hashes_to_process))
+        logger.info("  - Not in field mapping or no relevant field types: %d", skipped_count)
         
         if self.config['system']['mode'] == 'dev':
             # In dev mode, limit the number of strings to embed
             dev_sample_size = min(self.config['system']['dev_sample_size'], len(strings_to_embed))
-            hash_sample = list(strings_to_embed.keys())[:dev_sample_size]
-            strings_to_embed = {h: strings_to_embed[h] for h in hash_sample}
+            sample_hashes = list(strings_to_embed.keys())[:dev_sample_size]
+            strings_to_embed = {h: strings_to_embed[h] for h in sample_hashes}
             logger.info("Dev mode: limited to %d strings", len(strings_to_embed))
         
         # Organize strings into batches
@@ -157,27 +207,19 @@ class Embedder:
                     
                     # Log progress
                     if (batch_idx + 1) % 10 == 0:
-                        logger.info("Processed %d/%d batches, %d tokens", 
-                                   batch_idx + 1, len(batches), total_tokens)
+                        logger.info("Processed %d/%d batches, %d tokens, %d strings", 
+                                   batch_idx + 1, len(batches), total_tokens, len(processed_hashes))
                         logger.info("Memory usage: %.2f GB", get_memory_usage())
                     
-                    # Save checkpoint
-                    if self.config['data']['checkpoints_enabled'] and (batch_idx + 1) % 100 == 0:
-                        checkpoint_path = Path(self.config['system']['checkpoint_dir']) / f"embedding_{batch_idx}.ckpt"
-                        save_checkpoint({
-                            'embeddings': self.embeddings,
-                            'processed_hashes': list(processed_hashes)
-                        }, checkpoint_path)
+                    # Save checkpoint periodically
+                    if self.config['data']['checkpoints_enabled'] and ((batch_idx + 1) % 50 == 0 or batch_idx == len(batches) - 1):
+                        self._save_checkpoint(processed_hashes, batch_idx)
                 
                 except Exception as e:
                     logger.error("Error embedding batch %d: %s", batch_idx, str(e))
                     
                     # Save checkpoint on error
-                    error_checkpoint = Path(self.config['system']['checkpoint_dir']) / f"embedding_error_{batch_idx}.ckpt"
-                    save_checkpoint({
-                        'embeddings': self.embeddings,
-                        'processed_hashes': list(processed_hashes)
-                    }, error_checkpoint)
+                    self._save_checkpoint(processed_hashes, f"error_{batch_idx}")
                     
                     # Continue with next batch
                     continue
@@ -185,33 +227,61 @@ class Embedder:
         # Save final results
         self._save_results(processed_hashes)
         
+        # Calculate percentage completion
+        completion_pct = (len(processed_hashes) / len(all_hashes)) * 100 if all_hashes else 0
+        
         results = {
             'strings_embedded': len(processed_hashes),
+            'total_strings': len(all_hashes),
+            'completion_percentage': completion_pct,
             'total_tokens': total_tokens,
             'total_requests': total_requests,
             'duration': timer.duration
         }
         
-        logger.info("Embedding completed: %d strings embedded, %d tokens, %.2f seconds",
-                   len(processed_hashes), total_tokens, timer.duration)
+        logger.info("Embedding completed: %d strings embedded (%.2f%%), %d tokens, %.2f seconds",
+                   len(processed_hashes), completion_pct, total_tokens, timer.duration)
         
         return results
 
     def _load_unique_strings(self):
         """
-        Load unique strings from preprocessing results.
-        
-        Returns:
-            dict: Dictionary of hash -> string value
+        Load unique strings with support for both original and enhanced preprocessor.
         """
         try:
-            # In a real implementation, this would load from the preprocessor's output
-            # For now, just load from a sample file
             output_dir = Path(self.config['system']['output_dir'])
-            with open(output_dir / "unique_strings_sample.json", 'r') as f:
-                unique_strings_sample = json.load(f)
             
-            return unique_strings_sample
+            # Try to load from index first (enhanced preprocessor)
+            index_path = output_dir / "unique_strings_index.json"
+            if index_path.exists():
+                with open(index_path, 'r') as f:
+                    index = json.load(f)
+                
+                location = index.get('location')
+                
+                if location != "in-memory" and os.path.exists(location):
+                    # Load from memory-mapped file
+                    unique_strings_mmap = MMapDict(location)
+                    
+                    # Convert to regular dictionary for processing
+                    # This is memory-intensive but necessary for large datasets
+                    # We'll process in batches in execute() to mitigate this
+                    count = index.get('count', 0)
+                    logger.info("Loading %d strings from memory-mapped file", count)
+                    
+                    if count > 1000000:  # If more than 1M strings, we don't fully materialize
+                        # Return a proxy that will be used for key checking only
+                        return UniqueStringsProxy(unique_strings_mmap)
+                    else:
+                        return unique_strings_mmap.to_dict()
+                else:
+                    # Fall back to sample file
+                    with open(output_dir / "unique_strings_sample.json", 'r') as f:
+                        return json.load(f)
+            else:
+                # Fall back to original approach
+                with open(output_dir / "unique_strings_sample.json", 'r') as f:
+                    return json.load(f)
         
         except Exception as e:
             logger.error("Error loading unique strings: %s", str(e))
@@ -219,17 +289,34 @@ class Embedder:
 
     def _load_field_hash_mapping(self):
         """
-        Load field hash mapping from preprocessing results.
-        
-        Returns:
-            dict: Dictionary of hash -> {field -> count}
+        Load field hash mapping with support for both original and enhanced preprocessor.
         """
         try:
             output_dir = Path(self.config['system']['output_dir'])
-            with open(output_dir / "field_hash_mapping_sample.json", 'r') as f:
-                field_hash_mapping_sample = json.load(f)
             
-            return field_hash_mapping_sample
+            # Try to load from index first (enhanced preprocessor)
+            index_path = output_dir / "field_hash_index.json"
+            if index_path.exists():
+                with open(index_path, 'r') as f:
+                    index = json.load(f)
+                
+                location = index.get('location')
+                
+                if location != "in-memory" and os.path.exists(location):
+                    # Load from memory-mapped file
+                    field_hash_mmap = MMapDict(location)
+                    
+                    # For field hash mapping, we can afford to materialize
+                    # since it's much smaller than the unique strings
+                    return field_hash_mmap.to_dict()
+                else:
+                    # Fall back to sample file
+                    with open(output_dir / "field_hash_mapping_sample.json", 'r') as f:
+                        return json.load(f)
+            else:
+                # Fall back to original approach
+                with open(output_dir / "field_hash_mapping_sample.json", 'r') as f:
+                    return json.load(f)
         
         except Exception as e:
             logger.error("Error loading field hash mapping: %s", str(e))
@@ -238,12 +325,6 @@ class Embedder:
     def _create_batches(self, strings_to_embed):
         """
         Organize strings into batches for embedding.
-        
-        Args:
-            strings_to_embed (dict): Dictionary of hash -> string value
-            
-        Returns:
-            list: List of batches, where each batch is a list of hashes
         """
         batch_size = self.batch_size
         hashes = list(strings_to_embed.keys())
@@ -254,13 +335,7 @@ class Embedder:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def _embed_batch(self, batch_strings):
         """
-        Generate embeddings for a batch of strings.
-        
-        Args:
-            batch_strings (list): List of strings to embed
-            
-        Returns:
-            tuple: (list of embeddings, tokens used)
+        Generate embeddings for a batch of strings with retry logic.
         """
         try:
             response = self.client.embeddings.create(
@@ -309,46 +384,92 @@ class Embedder:
             logger.info("Token limit reached, waiting %.2f seconds", wait_time)
             time.sleep(wait_time)
 
+    def _save_checkpoint(self, processed_hashes, batch_idx):
+        """
+        Save checkpoint for embedding progress.
+        """
+        try:
+            checkpoint_dir = Path(self.config['system']['checkpoint_dir'])
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            
+            checkpoint_path = checkpoint_dir / f"embedding_{batch_idx}.ckpt"
+            
+            # For memory-mapped storage, create a lightweight checkpoint
+            if self.use_mmap:
+                # Flush memory-mapped dictionary
+                self.embeddings.flush()
+                
+                # Create lightweight checkpoint with only processed hashes and state
+                lightweight_checkpoint = {
+                    'processed_hashes': list(processed_hashes),
+                    'request_timestamps': self.request_timestamps,
+                    'token_counts': self.token_counts,
+                    'embeddings_location': str(self.mmap_dir / "embeddings.mmap"),
+                    'embeddings_count': len(processed_hashes)
+                }
+                
+                with open(checkpoint_path, 'wb') as f:
+                    pickle.dump(lightweight_checkpoint, f)
+            else:
+                # For in-memory storage, save complete checkpoint
+                # but with only the processed embeddings to save space
+                processed_embeddings = {h: self.embeddings[h] for h in processed_hashes if h in self.embeddings}
+                
+                save_checkpoint({
+                    'embeddings': processed_embeddings,
+                    'processed_hashes': list(processed_hashes),
+                    'request_timestamps': self.request_timestamps,
+                    'token_counts': self.token_counts
+                }, checkpoint_path)
+            
+            logger.info("Saved embedding checkpoint at %s with %d processed hashes", 
+                       checkpoint_path, len(processed_hashes))
+        
+        except Exception as e:
+            logger.error("Error saving checkpoint: %s", str(e))
+
     def _save_results(self, processed_hashes):
         """
-        Save embedding results to disk.
-        
-        Args:
-            processed_hashes (set): Set of processed hash values
+        Save embedding results in a scalable way.
         """
         output_dir = Path(self.config['system']['output_dir'])
-        output_dir.mkdir(exist_ok=True)
+        output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Save embedding index
+        embedding_index = {
+            'count': len(processed_hashes),
+            'location': str(self.mmap_dir / "embeddings.mmap") if self.use_mmap else "in-memory",
+            'dimensions': self.config['embedding']['dimensions'],
+            'model': self.model
+        }
+        
+        with open(output_dir / "embedding_index.json", 'w') as f:
+            json.dump(embedding_index, f, indent=2)
         
         # Save list of embedded hashes
         with open(output_dir / "embedded_hashes.json", 'w') as f:
-            json.dump(list(processed_hashes), f)
+            json.dump(list(processed_hashes)[:10000], f)  # Save first 10K for reference
         
-        # Save sample of embeddings
-        sample_size = min(10, len(self.embeddings))
-        sample_hashes = list(self.embeddings.keys())[:sample_size]
-        sample_embeddings = {h: self.embeddings[h] for h in sample_hashes}
+        # For memory-mapped storage, ensure everything is flushed
+        if self.use_mmap:
+            self.embeddings.flush()
         
-        with open(output_dir / "embeddings_sample.json", 'w') as f:
-            json.dump(sample_embeddings, f, indent=2)
+        # Create a separate file with embedding info for Weaviate indexing
+        embedding_info = {
+            'count': len(processed_hashes),
+            'dimensions': self.config['embedding']['dimensions'],
+            'model': self.model,
+            'processed_hashes': list(processed_hashes)[:1000]  # Sample for reference
+        }
         
-        # Save final checkpoint
-        checkpoint_path = Path(self.config['system']['checkpoint_dir']) / "embedding_final.ckpt"
-        save_checkpoint({
-            'embeddings': self.embeddings,
-            'processed_hashes': list(processed_hashes)
-        }, checkpoint_path)
+        with open(output_dir / "embedding_info.json", 'w') as f:
+            json.dump(embedding_info, f, indent=2)
         
         logger.info("Embedding results saved to %s", output_dir)
 
     def get_embedding(self, text):
         """
         Get embedding for a single text string.
-        
-        Args:
-            text (str): Text to embed
-            
-        Returns:
-            list: Embedding vector
         """
         response = self.client.embeddings.create(
             model=self.model,
@@ -357,3 +478,43 @@ class Embedder:
         )
         
         return response.data[0].embedding
+
+    def get_embedding_by_hash(self, hash_value):
+        """
+        Get embedding for a hash value.
+        """
+        if hash_value in self.embeddings:
+            return self.embeddings[hash_value]
+        
+        return None
+
+
+class UniqueStringsProxy:
+    """
+    Proxy class for handling large unique strings collections without
+    fully materializing them in memory.
+    """
+    
+    def __init__(self, mmap_dict):
+        """
+        Initialize with a memory-mapped dictionary.
+        """
+        self.mmap_dict = mmap_dict
+    
+    def __contains__(self, key):
+        """
+        Check if key exists in the underlying dictionary.
+        """
+        return key in self.mmap_dict
+    
+    def keys(self):
+        """
+        Return iterator over keys.
+        """
+        return self.mmap_dict.keys()
+    
+    def __getitem__(self, key):
+        """
+        Get value for key.
+        """
+        return self.mmap_dict[key]
