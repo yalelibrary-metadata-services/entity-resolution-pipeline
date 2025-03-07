@@ -963,7 +963,7 @@ class FeatureEngineer:
         # Estimate cosine similarity for each field type
         field_similarities = {}
         for field in ['person', 'title', 'provision', 'subjects', 'composite']:
-            feature_index = feature_names.index(f"{field}_cosine") if f"{field}_cosine}" in feature_names else -1
+            feature_index = feature_names.index(f"{field}_cosine") if f"{field}_cosine" in feature_names else -1
             
             if feature_index >= 0:
                 field1_hash = record1_fields.get(field, 'NULL')

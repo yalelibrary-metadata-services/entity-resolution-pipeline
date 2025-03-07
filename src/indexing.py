@@ -62,17 +62,36 @@ class Indexer:
                    self.weaviate_host, self.weaviate_port)
 
     def execute(self, checkpoint=None):
-        """
-        Execute indexing of embeddings in Weaviate with scalable approach.
-        """
+        """Execute indexing of embeddings in Weaviate with scalable approach."""
         # Load checkpoint if provided
         if checkpoint and os.path.exists(checkpoint):
             state = load_checkpoint(checkpoint)
             indexed_hashes = set(state.get('indexed_hashes', []))
-            logger.info("Resumed indexing from checkpoint: %s with %d indexed hashes", 
-                       checkpoint, len(indexed_hashes))
+            logger.info(f"Resumed indexing from checkpoint: {checkpoint} with {len(indexed_hashes)} indexed hashes")
         else:
-            indexed_hashes = set()
+            # Check for existing checkpoints
+            checkpoint_dir = Path(self.config['system']['checkpoint_dir'])
+            indexing_checkpoint = checkpoint_dir / "indexing_final.ckpt"
+            
+            if indexing_checkpoint.exists():
+                state = load_checkpoint(indexing_checkpoint)
+                indexed_hashes = set(state.get('indexed_hashes', []))
+                logger.info(f"Found existing indexing checkpoint with {len(indexed_hashes)} indexed hashes")
+            else:
+                indexed_hashes = set()
+        
+        # Check if indexing is already complete
+        if self._check_indexing_complete():
+            logger.info("Indexing is already complete, skipping indexing")
+            stats = self._get_collection_stats()
+            return {
+                'objects_indexed': stats.get('object_count', 0),
+                'total_embedded': stats.get('object_count', 0),
+                'completion_percentage': 100.0,
+                'total_in_collection': stats.get('object_count', 0),
+                'duration': 0.0,
+                'skipped': True
+            }
         
         # Verify or create schema
         self._create_or_update_schema()
@@ -83,8 +102,20 @@ class Indexer:
         # Filter hashes that haven't been indexed yet
         hashes_to_index = [h for h in embedded_hashes if h not in indexed_hashes]
         
-        logger.info("Indexing %d/%d embedded hashes", 
-                   len(hashes_to_index), len(embedded_hashes))
+        # If all hashes are already indexed, return early
+        if not hashes_to_index:
+            stats = self._get_collection_stats()
+            logger.info(f"All {len(embedded_hashes)} hashes are already indexed")
+            return {
+                'objects_indexed': 0,
+                'total_embedded': len(embedded_hashes),
+                'completion_percentage': 100.0,
+                'total_in_collection': stats.get('object_count', 0),
+                'duration': 0.0,
+                'skipped': True
+            }
+        
+        logger.info(f"Indexing {len(hashes_to_index)}/{len(embedded_hashes)} embedded hashes")
         
         if self.config['system']['mode'] == 'dev':
             # In dev mode, limit the number of hashes to index
@@ -171,6 +202,67 @@ class Indexer:
                    total_indexed, completion_pct, timer.duration)
         
         return results
+
+    def _check_indexing_complete(self):
+        """
+        Check if indexing is already complete by comparing object count to expected count.
+        
+        Returns:
+            bool: True if indexing is complete, False otherwise
+        """
+        try:
+            # Check if collection exists
+            collections = self._execute_weaviate_operation(
+                lambda: self.client.collections.list_all()
+            )
+            
+            if self.collection_name not in collections:
+                logger.info(f"Collection {self.collection_name} does not exist in Weaviate")
+                return False
+            
+            # Get collection statistics
+            collection = self._execute_weaviate_operation(
+                lambda: self.client.collections.get(self.collection_name)
+            )
+            
+            count_result = self._execute_weaviate_operation(
+                lambda: collection.aggregate.over_all(total_count=True)
+            )
+            
+            # Get field distribution
+            from weaviate.classes.aggregate import GroupByAggregate
+            
+            field_type_result = self._execute_weaviate_operation(
+                lambda: collection.aggregate.over_all(
+                    group_by=GroupByAggregate(prop="field_type"),
+                    total_count=True
+                )
+            )
+            
+            # Load embedded hashes count from checkpoint
+            checkpoint_dir = Path(self.config['system']['checkpoint_dir'])
+            embedding_checkpoint = checkpoint_dir / "embedding_final.ckpt"
+            
+            if embedding_checkpoint.exists():
+                state = load_checkpoint(embedding_checkpoint)
+                processed_hashes_count = len(state.get('processed_hashes', []))
+                
+                # Estimate expected object count (one object per field type per hash)
+                # This is a rough estimate since we don't know how many field types each hash has
+                # Assume average of 3 field types per hash
+                expected_count = processed_hashes_count * 3
+                
+                # If we have at least 90% of expected objects, consider indexing as complete
+                completion_percentage = (count_result.total_count / max(1, expected_count)) * 100
+                logger.info(f"Found {count_result.total_count} objects in Weaviate ({completion_percentage:.2f}% of expected)")
+                
+                return completion_percentage >= 90.0
+            
+            return False
+        
+        except Exception as e:
+            logger.error(f"Error checking indexing completion: {str(e)}")
+            return False
 
     def _connect_to_weaviate(self):
         """

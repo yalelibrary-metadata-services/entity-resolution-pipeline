@@ -89,7 +89,6 @@ class Pipeline:
         Returns:
             dict: Pipeline execution results and metrics
         """
-        # Load checkpoint if provided
         if checkpoint:
             self.state = load_checkpoint(checkpoint)
             logger.info("Resumed pipeline execution from checkpoint: %s", checkpoint)
@@ -118,10 +117,29 @@ class Pipeline:
         if end_at:
             end_idx = next((i for i, (name, _) in enumerate(stages) if name == end_at), len(stages) - 1)
         
+        # Look for existing checkpoints for each stage
+        for i, (stage_name, _) in enumerate(stages):
+            # Look for stage checkpoint
+            checkpoint_path = Path(self.config['system']['checkpoint_dir']) / f"pipeline_{stage_name}.ckpt"
+            stage_checkpoint_path = Path(self.config['system']['checkpoint_dir']) / f"{stage_name}_final.ckpt"
+            
+            if checkpoint_path.exists() or stage_checkpoint_path.exists():
+                # If this stage already has a checkpoint and is before our start stage, update start_idx
+                if i < start_idx:
+                    continue
+                    
+                if stage_name not in self.state.get('completed_stages', []):
+                    logger.info(f"Found existing checkpoint for stage {stage_name}, marking as completed")
+                    if 'completed_stages' not in self.state:
+                        self.state['completed_stages'] = []
+                    self.state['completed_stages'].append(stage_name)
+        
         # Skip completed stages if resuming from checkpoint
-        if checkpoint and self.state['completed_stages']:
+        if checkpoint and self.state.get('completed_stages'):
             last_completed = self.state['completed_stages'][-1]
-            start_idx = next((i for i, (name, _) in enumerate(stages) if name == last_completed), 0) + 1
+            last_completed_idx = next((i for i, (name, _) in enumerate(stages) if name == last_completed), -1)
+            start_idx = max(start_idx, last_completed_idx + 1)
+            logger.info(f"Resuming from after stage {last_completed} (index {last_completed_idx})")
         
         # Execute selected stages
         results = {}
@@ -129,13 +147,24 @@ class Pipeline:
         
         try:
             for i, (stage_name, component) in enumerate(stages[start_idx:end_idx+1], start_idx):
+                # If stage is already in completed_stages, skip it
+                if stage_name in self.state.get('completed_stages', []):
+                    logger.info(f"Skipping already completed stage: {stage_name}")
+                    continue
+                    
                 stage_start = time.time()
                 self.state['current_stage'] = stage_name
                 
-                logger.info("Executing pipeline stage: %s (%d/%d)", stage_name, i+1, end_idx+1)
+                logger.info(f"Executing pipeline stage: {stage_name} ({i+1}/{end_idx+1})")
                 
-                # Execute stage and get results
-                stage_result = component.execute()
+                # Get the checkpoint path for this specific component
+                component_checkpoint = Path(self.config['system']['checkpoint_dir']) / f"{stage_name}_final.ckpt"
+                if component_checkpoint.exists():
+                    logger.info(f"Using existing checkpoint for stage {stage_name}: {component_checkpoint}")
+                    stage_result = component.execute(checkpoint=str(component_checkpoint))
+                else:
+                    stage_result = component.execute()
+                    
                 results[stage_name] = stage_result
                 
                 # Update state
@@ -150,19 +179,13 @@ class Pipeline:
                 checkpoint_path = Path(self.config['system']['checkpoint_dir']) / f"pipeline_{stage_name}.ckpt"
                 save_checkpoint(self.state, checkpoint_path)
                 
-                # After executing the feature engineering stage:
-                if stage_name == 'features':
-                    logger.info("Performing feature files diagnostic check...")
-                    feature_engineer = self.components['feature_engineer']
-                    feature_engineer._check_feature_files()
-
-                logger.info("Completed stage: %s in %.2f seconds", stage_name, stage_duration)
+                logger.info(f"Completed stage: {stage_name} in {stage_duration:.2f} seconds")
         
         except Exception as e:
             # Save checkpoint on error
             error_checkpoint = Path(self.config['system']['checkpoint_dir']) / "pipeline_error.ckpt"
             save_checkpoint(self.state, error_checkpoint)
-            logger.error("Pipeline execution failed at stage: %s - %s", self.state['current_stage'], str(e))
+            logger.error(f"Pipeline execution failed at stage: {self.state['current_stage']} - {str(e)}")
             raise
         
         # Finalize pipeline execution
@@ -187,7 +210,7 @@ class Pipeline:
         # Clean up resources
         self._cleanup_resources()
 
-        logger.info("Pipeline execution completed in %.2f seconds", total_duration)
+        logger.info(f"Pipeline execution completed in {total_duration:.2f} seconds")
         return results
 
     def get_status(self):

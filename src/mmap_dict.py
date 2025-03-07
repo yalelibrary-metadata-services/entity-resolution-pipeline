@@ -118,6 +118,12 @@ class MMapDict:
         """
         return dict(self.data)
     
+    def update(self, other_dict):
+        """Update dictionary with key-value pairs from other_dict."""
+        for key, value in other_dict.items():
+            self.data[key] = value
+        self._dirty = True
+
     def close(self):
         """Flush data and close."""
         self.flush()

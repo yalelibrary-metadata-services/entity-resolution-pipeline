@@ -11,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import openai
+import weaviate
 from tenacity import retry, stop_after_attempt, wait_exponential
 import mmh3
 
@@ -81,9 +82,7 @@ class Embedder:
             self.embeddings = {}
 
     def execute(self, checkpoint=None):
-        """
-        Execute embedding generation for large datasets.
-        """
+        """Execute embedding generation for large datasets."""
         # Load checkpoint if provided
         if checkpoint and os.path.exists(checkpoint):
             state = load_checkpoint(checkpoint)
@@ -102,10 +101,46 @@ class Embedder:
             self.request_timestamps = state.get('request_timestamps', [])
             self.token_counts = state.get('token_counts', [])
             
-            logger.info("Resumed embedding from checkpoint: %s with %d processed hashes", 
-                       checkpoint, len(processed_hashes))
+            logger.info(f"Resumed embedding from checkpoint: {checkpoint} with {len(processed_hashes)} processed hashes")
         else:
-            processed_hashes = set()
+            # Look for existing checkpoint
+            checkpoint_dir = Path(self.config['system']['checkpoint_dir'])
+            embedding_checkpoint = checkpoint_dir / "embedding_final.ckpt"
+            
+            if embedding_checkpoint.exists():
+                state = load_checkpoint(embedding_checkpoint)
+                # Load processed hashes from checkpoint
+                processed_hashes = set(state.get('processed_hashes', []))
+                logger.info(f"Found existing embedding checkpoint with {len(processed_hashes)} processed hashes")
+                
+                # For memory-mapped storage, load embeddings
+                if self.use_mmap:
+                    embeddings_location = state.get('embeddings_location')
+                    if embeddings_location and os.path.exists(embeddings_location):
+                        logger.info(f"Using existing embeddings from {embeddings_location}")
+                        self.embeddings = MMapDict(embeddings_location)
+                else:
+                    # For in-memory storage, we can directly assign
+                    self.embeddings = state.get('embeddings', {})
+                    
+                # Load rate limiting state
+                self.request_timestamps = state.get('request_timestamps', [])
+                self.token_counts = state.get('token_counts', [])
+            else:
+                processed_hashes = set()
+        
+        # Check if embeddings are already in Weaviate
+        if self._check_embeddings_in_weaviate():
+            logger.info("Embeddings already indexed in Weaviate, skipping embedding generation")
+            return {
+                'strings_embedded': len(processed_hashes),
+                'total_strings': len(processed_hashes),
+                'completion_percentage': 100.0,
+                'total_tokens': 0,
+                'total_requests': 0,
+                'duration': 0.0,
+                'skipped': True
+            }
         
         # Load hash array or unique strings
         # This approach supports both the enhanced preprocessor and the original one
@@ -243,6 +278,55 @@ class Embedder:
                    len(processed_hashes), completion_pct, total_tokens, timer.duration)
         
         return results
+
+    def _check_embeddings_in_weaviate(self):
+        """
+        Check if embeddings are already indexed in Weaviate.
+        
+        Returns:
+            bool: True if embeddings are already indexed, False otherwise
+        """
+        try:
+            # Connect to Weaviate
+            client = openai.OpenAI(api_key=self.api_key)
+            weaviate_client = weaviate.connect_to_local(
+                # host=self.config['weaviate']['host'],
+                # port=self.config['weaviate']['port']
+            )
+            
+            # Check if collection exists
+            collection_name = self.config['weaviate']['collection_name']
+            collections = weaviate_client.collections.list_all()
+            
+            if collection_name not in collections:
+                logger.info(f"Collection {collection_name} does not exist in Weaviate")
+                return False
+            
+            # Check if collection has objects
+            collection = weaviate_client.collections.get(collection_name)
+            count_result = collection.aggregate.over_all(total_count=True)
+            
+            # If collection exists and has objects, check if it's sufficient
+            if count_result.total_count > 0:
+                # Get field hash mapping to estimate expected object count
+                field_hash_mapping = self._load_field_hash_mapping()
+                expected_count = 0
+                
+                # Estimate expected object count (one object per field type per hash)
+                for hash_value, field_types in field_hash_mapping.items():
+                    expected_count += len(field_types)
+                
+                # If we have at least 90% of expected objects, consider embeddings as indexed
+                completion_percentage = (count_result.total_count / max(1, expected_count)) * 100
+                logger.info(f"Found {count_result.total_count} objects in Weaviate ({completion_percentage:.2f}% of expected)")
+                
+                return completion_percentage >= 90.0
+            
+            return False
+        
+        except Exception as e:
+            logger.error(f"Error checking embeddings in Weaviate: {str(e)}")
+            return False
 
     def _load_unique_strings(self):
         """

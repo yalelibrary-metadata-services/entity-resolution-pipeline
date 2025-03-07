@@ -431,7 +431,7 @@ class QueryEngine:
             
             # Execute search
             results = collection.query.near_vector(
-                near_vector={field_type: query_vector},
+                near_vector=query_vector.tolist(),
                 filters=field_filter,
                 limit=limit,
                 return_metadata=MetadataQuery(distance=True),
@@ -643,8 +643,9 @@ def process_batch_worker(batch_dict, config, similarity_threshold):
             field_filter = Filter.by_property("field_type").equal('person')
             
             # Execute search
+            
             similar_results = collection.query.near_vector(
-                near_vector={'person': person_vector},
+                near_vector=person_vector.tolist(),
                 filters=field_filter,
                 limit=100,
                 return_metadata=MetadataQuery(distance=True),
