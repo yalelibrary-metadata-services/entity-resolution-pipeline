@@ -172,6 +172,12 @@ class Preprocessor:
             'unique_records': len(self.record_field_hashes)
         }
         
+        # Add this before saving results
+        logger.info(f"String count before deduplication: {len(self.string_counts)}")
+        # Create a set of unique normalized texts to check true uniqueness
+        unique_values = set(self.unique_strings.values())
+        logger.info(f"True unique string count based on values: {len(unique_values)}")
+
         logger.info("Preprocessing completed: %d records processed, %d unique strings",
                    total_records, len(self.unique_strings))
         
@@ -351,30 +357,76 @@ class Preprocessor:
 
     def _update_data_structures(self, batch_data):
         """
-        Update data structures with batch results.
+        Update data structures with batch results with improved deduplication.
         """
-        # Update unique strings
+        # Create value-to-hash mapping for consistent hashing
+        value_to_hash = {}
+        
+        # First pass: build value_to_hash mapping 
         for value_hash, value in batch_data['unique_strings'].items():
+            normalized_value = self._normalize_text(value)
+            if normalized_value not in value_to_hash:
+                value_to_hash[normalized_value] = value_hash
+            else:
+                # We found a hash collision - use the existing hash for this value
+                # This is the key part that ensures consistent hashing
+                logger.debug(f"Hash collision detected: '{normalized_value}' has multiple hashes")
+        
+        # Update unique strings using consistent hashing
+        for normalized_value, value_hash in value_to_hash.items():
             if value_hash not in self.unique_strings:
-                self.unique_strings[value_hash] = value
+                # Find the original value for this normalized value
+                original_value = next((val for h, val in batch_data['unique_strings'].items() 
+                                    if self._normalize_text(val) == normalized_value), normalized_value)
+                self.unique_strings[value_hash] = original_value
         
         # Update string counts
         for value_hash, count in batch_data['string_counts'].items():
-            self.string_counts[value_hash] = self.string_counts.get(value_hash, 0) + count
+            normalized_value = self._normalize_text(batch_data['unique_strings'].get(value_hash, ''))
+            consistent_hash = value_to_hash.get(normalized_value, value_hash)
+            self.string_counts[consistent_hash] = self.string_counts.get(consistent_hash, 0) + count
         
-        # Update record field hashes
-        self.record_field_hashes.update(batch_data['record_field_hashes'])
-        
-        # Update field hash mapping
-        for value_hash, field_counts in batch_data['field_hash_mapping'].items():
-            if value_hash not in self.field_hash_mapping:
-                self.field_hash_mapping[value_hash] = {}
+        # Update record field hashes with consistent hashing
+        for record_id, field_hashes in batch_data['record_field_hashes'].items():
+            consistent_field_hashes = {}
+            for field, value_hash in field_hashes.items():
+                if value_hash == 'NULL':
+                    consistent_field_hashes[field] = 'NULL'
+                    continue
+                    
+                if value_hash in batch_data['unique_strings']:
+                    normalized_value = self._normalize_text(batch_data['unique_strings'][value_hash])
+                    consistent_hash = value_to_hash.get(normalized_value, value_hash)
+                    consistent_field_hashes[field] = consistent_hash
+                else:
+                    consistent_field_hashes[field] = value_hash
             
-            for field, count in field_counts.items():
-                if field not in self.field_hash_mapping[value_hash]:
-                    self.field_hash_mapping[value_hash][field] = 0
+            self.record_field_hashes[record_id] = consistent_field_hashes
+        
+        # Update field hash mapping with consistent hashing
+        for value_hash, field_counts in batch_data['field_hash_mapping'].items():
+            if value_hash in batch_data['unique_strings']:
+                normalized_value = self._normalize_text(batch_data['unique_strings'][value_hash])
+                consistent_hash = value_to_hash.get(normalized_value, value_hash)
                 
-                self.field_hash_mapping[value_hash][field] += count
+                if consistent_hash not in self.field_hash_mapping:
+                    self.field_hash_mapping[consistent_hash] = {}
+                
+                for field, count in field_counts.items():
+                    if field not in self.field_hash_mapping[consistent_hash]:
+                        self.field_hash_mapping[consistent_hash][field] = 0
+                    
+                    self.field_hash_mapping[consistent_hash][field] += count
+            else:
+                # Fall back to original behavior for hashes not in unique_strings
+                if value_hash not in self.field_hash_mapping:
+                    self.field_hash_mapping[value_hash] = {}
+                
+                for field, count in field_counts.items():
+                    if field not in self.field_hash_mapping[value_hash]:
+                        self.field_hash_mapping[value_hash][field] = 0
+                    
+                    self.field_hash_mapping[value_hash][field] += count
 
     def _normalize_text(self, text):
         """
@@ -397,10 +449,29 @@ class Preprocessor:
 
     def _hash_string(self, text):
         """
-        Generate hash for a string using MurmurHash for better performance.
+        Generate consistent hash for a string using MurmurHash.
         """
-        # MurmurHash is much faster than MD5/SHA and has low collision rate
-        return str(mmh3.hash128(text))
+        # Normalize the text thoroughly for consistent hashing
+        if text is None:
+            return "NULL"
+            
+        # Convert to string if not already
+        if not isinstance(text, str):
+            text = str(text)
+        
+        # Apply thorough normalization
+        normalized = text.strip().lower()
+        
+        # Remove all whitespace variations 
+        import re
+        normalized = re.sub(r'\s+', ' ', normalized)
+        
+        # Final trim
+        normalized = normalized.strip()
+        
+        # Use MurmurHash for better performance and consistency
+        # Use fixed seed for reproducibility
+        return str(mmh3.hash128(normalized, seed=42))
 
     def _load_record_field_hashes(self):
         """
@@ -490,7 +561,7 @@ class Preprocessor:
 
     def _create_lookup_tables(self):
         """
-        Create lookup tables for efficient access.
+        Create lookup tables for efficient access with improved field-hash mapping.
         """
         output_dir = Path(self.config['system']['output_dir'])
         
@@ -516,6 +587,43 @@ class Preprocessor:
             else:
                 json.dump(person_id_lookup, f)
         
+        # IMPORTANT FIX: Rebuild field_hash_mapping from record_field_hashes to ensure consistency
+        logger.info("Rebuilding field_hash_mapping from record_field_hashes for consistency")
+        rebuilt_field_hash_mapping = {}
+        
+        # Iterate through all record field hashes to build complete field mapping
+        for record_id, field_hashes in self.record_field_hashes.items():
+            for field, hash_value in field_hashes.items():
+                if hash_value == 'NULL':
+                    continue
+                    
+                if hash_value not in rebuilt_field_hash_mapping:
+                    rebuilt_field_hash_mapping[hash_value] = {}
+                
+                if field not in rebuilt_field_hash_mapping[hash_value]:
+                    rebuilt_field_hash_mapping[hash_value][field] = 0
+                
+                rebuilt_field_hash_mapping[hash_value][field] += 1
+        
+        # Compare original and rebuilt mappings
+        original_hash_count = len(self.field_hash_mapping)
+        rebuilt_hash_count = len(rebuilt_field_hash_mapping)
+        
+        added_hashes = set(rebuilt_field_hash_mapping.keys()) - set(self.field_hash_mapping.keys())
+        missing_hashes = set(self.field_hash_mapping.keys()) - set(rebuilt_field_hash_mapping.keys())
+        
+        logger.info(f"Original field_hash_mapping had {original_hash_count} hashes")
+        logger.info(f"Rebuilt field_hash_mapping has {rebuilt_hash_count} hashes")
+        logger.info(f"Added {len(added_hashes)} missing hashes")
+        logger.info(f"Removed {len(missing_hashes)} invalid hashes")
+        
+        # Log a few examples of fixed hashes
+        for hash_value in list(added_hashes)[:5]:
+            logger.info(f"Fixed missing hash: {hash_value} with fields {rebuilt_field_hash_mapping[hash_value]}")
+        
+        # Update the field_hash_mapping with the rebuilt version
+        self.field_hash_mapping = rebuilt_field_hash_mapping
+        
         # Create field statistics for analysis
         field_stats = {}
         for value_hash, field_counts in self.field_hash_mapping.items():
@@ -533,6 +641,7 @@ class Preprocessor:
             json.dump(field_stats, f, indent=2)
         
         logger.info("Created lookup tables and statistics")
+        logger.info(f"Field statistics: {field_stats}")
 
     def get_hash_array(self):
         """

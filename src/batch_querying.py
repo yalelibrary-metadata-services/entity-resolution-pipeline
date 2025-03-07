@@ -432,7 +432,7 @@ class QueryEngine:
             # Execute search
             results = collection.query.near_vector(
                 near_vector=query_vector,
-                target_vector=['composite', 'person', 'title', 'provision', 'subjects'],
+                target_vector=[field_type],
                 filters=field_filter,
                 limit=limit,
                 return_metadata=MetadataQuery(distance=True),

@@ -329,8 +329,14 @@ class Indexer:
                 logger.info("Using existing collection schema")
                 return
             
+            logger.info("Collection %s does not exist in Weaviate", self.collection_name)
+            
             # Create collection with named vectors
             field_types = ["composite", "person", "title", "provision", "subjects"]
+            
+            # Import required enums and config classes
+            from weaviate.classes.config import Configure, Property, DataType, VectorDistances
+            from weaviate.classes.config import StopwordsPreset
             
             # Configure named vectors for each field type
             vector_configs = []
@@ -350,31 +356,52 @@ class Indexer:
             # Define properties
             properties = [
                 Property(name="hash", data_type=DataType.TEXT, index_filterable=True, 
-                         description="Hash of the text value"),
+                        description="Hash of the text value"),
                 Property(name="value", data_type=DataType.TEXT, index_filterable=True, 
-                         description="Original text value"),
+                        description="Original text value"),
                 Property(name="field_type", data_type=DataType.TEXT, index_filterable=True, 
-                         description="Type of field (composite, person, title, etc.)"),
+                        description="Type of field (composite, person, title, etc.)"),
                 Property(name="frequency", data_type=DataType.NUMBER, index_filterable=True, 
-                         description="Frequency of occurrence in the dataset")
+                        description="Frequency of occurrence in the dataset")
             ]
             
-            # Create collection with optimized settings
-            self._execute_weaviate_operation(
-                lambda: self.client.collections.create(
-                    name=self.collection_name,
-                    description="Entity resolution vectors collection",
-                    vectorizer_config=vector_configs,
-                    properties=properties,
-                    inverted_index_config={
-                        "indexTimestampPrecision": "s",  # Second-level precision is enough
-                        "stopwords": {"preset": "en"} 
-                    }
-                )
+            # Create collection with optimized settings - use Configure helpers
+            inverted_index = Configure.inverted_index(
+                index_timestamps=True,
+                index_property_length=True,
+                index_null_state=True                
             )
             
-            logger.info("Created Weaviate collection: %s with optimized schema", 
-                       self.collection_name)
+            try:
+                # Create collection with updated configuration
+                self._execute_weaviate_operation(
+                    lambda: self.client.collections.create(
+                        name=self.collection_name,
+                        description="Entity resolution vectors collection",
+                        vectorizer_config=vector_configs,
+                        properties=properties,
+                        inverted_index_config=inverted_index
+                    )
+                )
+                
+                logger.info("Created Weaviate collection: %s with optimized schema", 
+                        self.collection_name)
+                        
+            except Exception as e:
+                logger.error(f"Error creating collection with configured schema: {e}")
+                
+                # Fallback to simpler schema without inverted index config
+                logger.info("Trying with simplified schema...")
+                self._execute_weaviate_operation(
+                    lambda: self.client.collections.create(
+                        name=self.collection_name,
+                        description="Entity resolution vectors collection",
+                        vectorizer_config=vector_configs,
+                        properties=properties
+                    )
+                )
+                
+                logger.info("Created Weaviate collection with simplified schema")
         
         except Exception as e:
             logger.error("Error creating Weaviate schema: %s", str(e))
@@ -504,11 +531,20 @@ class Indexer:
 
     def _create_batches(self, hashes, embeddings, unique_strings, field_hash_mapping):
         """
-        Create batches of objects to index with optimized memory usage.
+        Create batches of objects to index with optimized memory usage and improved field handling.
         """
         batch_size = self.batch_size
         batches = []
         current_batch = []
+        
+        # Debugging hash that needs to be tracked (you mentioned it was missing)
+        debug_hash = "149694241953673352241727113736816909148"
+        if debug_hash in hashes:
+            logger.info(f"Debug hash {debug_hash} is in hashes to index")
+            if debug_hash in field_hash_mapping:
+                logger.info(f"Debug hash field types: {field_hash_mapping[debug_hash]}")
+            else:
+                logger.error(f"Debug hash not found in field_hash_mapping!")
         
         # Process in smaller chunks to avoid loading all embeddings at once
         for i in range(0, len(hashes), 1000):
@@ -518,18 +554,26 @@ class Indexer:
             for hash_value in chunk_hashes:
                 # Skip if embedding is missing
                 if hash_value not in embeddings:
-                    logger.debug("Skipping hash %s: No embedding found", hash_value)
+                    logger.debug(f"Skipping hash {hash_value}: No embedding found")
                     continue
                 
                 # Skip if not in unique strings (shouldn't happen but check anyway)
                 if hash_value not in unique_strings:
-                    logger.debug("Skipping hash %s: No unique string found", hash_value)
+                    logger.debug(f"Skipping hash {hash_value}: No unique string found")
                     continue
                 
-                # Skip if not in field hash mapping
+                # IMPORTANT FIX: Check if not in field_hash_mapping and log the error
                 if hash_value not in field_hash_mapping:
-                    logger.debug("Skipping hash %s: No field mapping found", hash_value)
-                    continue
+                    logger.error(f"Critical: Hash {hash_value} not found in field_hash_mapping but exists in unique_strings!")
+                    # We can build a fallback field mapping to fix it
+                    field_counts = self._find_field_usage_for_hash(hash_value)
+                    if field_counts:
+                        logger.info(f"Built fallback field mapping for {hash_value}: {field_counts}")
+                        field_hash_mapping[hash_value] = field_counts
+                    else:
+                        logger.warning(f"Unable to determine field types for hash {hash_value}, using generic 'value'")
+                        # Add a default field type to allow processing
+                        field_hash_mapping[hash_value] = {"value": 1}
                 
                 # Get string value and embedding
                 string_value = unique_strings[hash_value]
@@ -543,6 +587,10 @@ class Indexer:
                 
                 # Create an object for each field type
                 for field_type, count in field_types.items():
+                    # Special debugging for our problematic hash
+                    if hash_value == debug_hash:
+                        logger.info(f"Creating object for debug hash with field_type={field_type}, count={count}")
+                    
                     obj = {
                         'hash': hash_value,
                         'value': string_value,
@@ -559,14 +607,63 @@ class Indexer:
                         current_batch = []
             
             # Log progress
-            logger.debug("Processed %d/%d hashes, created %d batches", 
-                        i + len(chunk_hashes), len(hashes), len(batches))
+            logger.debug(f"Processed {i + len(chunk_hashes)}/{len(hashes)} hashes, created {len(batches)} batches")
         
         # Add last batch if not empty
         if current_batch:
             batches.append(current_batch)
         
         return batches
+
+    def _find_field_usage_for_hash(self, hash_value):
+        """
+        Search record_field_hashes to find where a hash is used.
+        This is a fallback to rebuild field mappings for missing hashes.
+        
+        Args:
+            hash_value (str): Hash to search for
+            
+        Returns:
+            dict: Field counts for this hash
+        """
+        field_counts = {}
+        
+        # Load record field hashes directory from output dir
+        output_dir = Path(self.config['system']['output_dir'])
+        record_field_hashes_path = output_dir / "record_field_hashes.json"
+        
+        try:
+            # First try to load full data if available
+            if record_field_hashes_path.exists():
+                with open(record_field_hashes_path, 'r') as f:
+                    record_field_hashes = json.load(f)
+                    
+                # Search for hash in all records and all fields
+                for record_id, fields in record_field_hashes.items():
+                    for field, field_hash in fields.items():
+                        if field_hash == hash_value:
+                            if field not in field_counts:
+                                field_counts[field] = 0
+                            field_counts[field] += 1
+            else:
+                # If not available, try the sample file
+                record_field_hashes_path = output_dir / "record_field_hashes_sample.json"
+                if record_field_hashes_path.exists():
+                    with open(record_field_hashes_path, 'r') as f:
+                        record_field_hashes = json.load(f)
+                        
+                    # Search for hash in all records and all fields
+                    for record_id, fields in record_field_hashes.items():
+                        for field, field_hash in fields.items():
+                            if field_hash == hash_value:
+                                if field not in field_counts:
+                                    field_counts[field] = 0
+                                field_counts[field] += 1
+        
+        except Exception as e:
+            logger.error(f"Error finding field usage for hash: {e}")
+        
+        return field_counts
 
     def _index_batch(self, collection, batch):
         """
@@ -705,6 +802,8 @@ class Indexer:
         }, checkpoint_path)
         
         logger.info("Indexing results saved to %s", output_dir)
+        debug_stats = debug_weaviate_collections()
+        logger.info(f"Weaviate collection stats: {debug_stats}")
 
     def search_by_vector(self, vector, field_type, limit=100, threshold=0.7):
         """
@@ -802,3 +901,65 @@ class Indexer:
                 self.client = None
         except Exception as e:
             logger.error("Error closing Weaviate client: %s", str(e))
+
+def debug_weaviate_collections():
+    """
+    Debug function to analyze the content of Weaviate collections.
+    """
+    try:
+        # Connect to Weaviate
+        client = weaviate.connect_to_local()
+        
+        # Get list of collections
+        collections = client.collections.list_all()
+        logger.info(f"Collections in Weaviate: {collections}")
+        
+        # Get the collection
+        collection_name = "UniqueStringsByField"  # Update with your actual collection name
+        if collection_name in collections:
+            collection = client.collections.get(collection_name)
+            
+            # Get total count
+            count_result = collection.aggregate.over_all(total_count=True)
+            logger.info(f"Total objects in collection: {count_result.total_count}")
+            
+            # Analyze distribution by field_type
+            from weaviate.classes.aggregate import GroupByAggregate
+            
+            field_type_result = collection.aggregate.over_all(
+                group_by=GroupByAggregate(prop="field_type"),
+                total_count=True
+            )
+            
+            logger.info("Field type distribution:")
+            for group in field_type_result.groups:
+                logger.info(f"  {group.grouped_by.value}: {group.total_count}")
+            
+            # Sample a few objects to verify
+            
+            
+            results = collection.query.fetch_objects(limit=5, include_vector=True)
+            logger.info(f"Sample objects: {len(results.objects)}")
+            
+            for obj in results.objects:
+                logger.info(f"Object fields: {obj.properties}")
+                logger.info(f"Vector dimensions: {len(next(iter(obj.vector.values()))) if obj.vector else 'No vector'}")
+            
+            # Close client
+            client.close()
+            
+            return {
+                "total_count": count_result.total_count,
+                "field_distribution": {
+                    group.grouped_by.value: group.total_count for group in field_type_result.groups
+                }
+            }
+        else:
+            logger.warning(f"Collection {collection_name} not found")
+            return {}
+    
+    except Exception as e:
+        logger.error(f"Error analyzing Weaviate collections: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {}

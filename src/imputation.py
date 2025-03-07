@@ -176,6 +176,46 @@ class Imputator:
         
         return results
 
+    def _save_results(self):
+        """
+        Save imputation results.
+        """
+        output_dir = Path(self.config['system']['output_dir'])
+        output_dir.mkdir(exist_ok=True)
+        
+        # Save imputed values
+        with open(output_dir / "imputed_values.json", 'w') as f:
+            json.dump(self.imputed_values, f, indent=2)
+        
+        # Save sample of imputed values
+        sample_size = min(100, len(self.imputed_values))
+        sample_records = list(self.imputed_values.keys())[:sample_size]
+        sample_values = {r: self.imputed_values[r] for r in sample_records}
+        
+        with open(output_dir / "imputed_values_sample.json", 'w') as f:
+            json.dump(sample_values, f, indent=2)
+        
+        # Save statistics
+        field_stats = {}
+        for record_id, fields in self.imputed_values.items():
+            for field, data in fields.items():
+                if field not in field_stats:
+                    field_stats[field] = 0
+                
+                field_stats[field] += 1
+        
+        with open(output_dir / "imputation_statistics.json", 'w') as f:
+            json.dump(field_stats, f, indent=2)
+        
+        # Save final checkpoint
+        checkpoint_path = Path(self.config['system']['checkpoint_dir']) / "imputation_final.ckpt"
+        save_checkpoint({
+            'imputed_values': self.imputed_values,
+            'processed_records': list(self.imputed_values.keys())
+        }, checkpoint_path)
+        
+        logger.info("Imputation results saved to %s", output_dir)
+
     def _connect_to_weaviate(self):
         """
         Connect to Weaviate instance.
@@ -294,7 +334,7 @@ class Imputator:
 
     def _impute_field(self, field, query_vector):
         """
-        Impute value for a field using vector similarity.
+        Impute value for a field using vector similarity with better query settings.
         
         Args:
             field (str): Field to impute
@@ -309,30 +349,23 @@ class Imputator:
             # Create filter for field type
             field_filter = Filter.by_property("field_type").equal(field)
             
-            if field == 'subjects':
-                # Execute search using composite vector
-                results = collection.query.near_vector(
-                    near_vector=query_vector,
-                    filters=field_filter,
-                    limit=self.max_candidates,
-                    return_metadata=MetadataQuery(distance=True),
-                    distance=0.3,
-                    target_vector=['subjects'],
-                    include_vector=True
-                )
-            else:
-                results = collection.query.near_vector(
-                    near_vector=query_vector,
-                    filters=field_filter,
-                    limit=self.max_candidates,
-                    return_metadata=MetadataQuery(distance=True),
-                    distance=0.3,
-                    target_vector=['provision'],
-                    include_vector=True
-                )
+            # Execute search with improved parameters - remove distance limit
+            # and increase limit to get more candidates
+            results = collection.query.near_vector(
+                near_vector=query_vector,
+                filters=field_filter,
+                limit=self.max_candidates * 2,  # Double the limit
+                return_metadata=MetadataQuery(distance=True),
+                # Remove distance parameter
+                # distance=0.3,  
+                target_vector=[field],  # Ensure we're targeting the right field
+                include_vector=True
+            )
+            
+            logger.info(f"Found {len(results.objects)} initial candidates for field {field}")
             
             if not results.objects:
-                logger.warning("No candidates found for field %s", field)
+                logger.warning(f"No candidates found for field {field}")
                 return None, None, None
             
             # Filter candidates by similarity threshold
@@ -350,11 +383,13 @@ class Imputator:
                         'similarity': similarity
                     })
             
+            logger.info(f"After filtering: {len(candidates)} candidates above threshold {self.similarity_threshold}")
+            
             if not candidates:
-                logger.warning("No candidates above similarity threshold for field %s", field)
+                logger.warning(f"No candidates above similarity threshold {self.similarity_threshold} for field {field}")
                 return None, None, None
             
-            # Impute value based on method
+            # Rest of the method remains the same...
             if self.imputation_method == 'nearest':
                 # Use nearest neighbor
                 imputed = candidates[0]
@@ -390,48 +425,10 @@ class Imputator:
                 return most_frequent_value, most_frequent_hash, imputed_vector.tolist()
         
         except Exception as e:
-            logger.error("Error imputing field %s: %s", field, str(e))
+            logger.error(f"Error imputing field {field}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None, None, None
-
-    def _save_results(self):
-        """
-        Save imputation results.
-        """
-        output_dir = Path(self.config['system']['output_dir'])
-        output_dir.mkdir(exist_ok=True)
-        
-        # Save imputed values
-        with open(output_dir / "imputed_values.json", 'w') as f:
-            json.dump(self.imputed_values, f, indent=2)
-        
-        # Save sample of imputed values
-        sample_size = min(100, len(self.imputed_values))
-        sample_records = list(self.imputed_values.keys())[:sample_size]
-        sample_values = {r: self.imputed_values[r] for r in sample_records}
-        
-        with open(output_dir / "imputed_values_sample.json", 'w') as f:
-            json.dump(sample_values, f, indent=2)
-        
-        # Save statistics
-        field_stats = {}
-        for record_id, fields in self.imputed_values.items():
-            for field, data in fields.items():
-                if field not in field_stats:
-                    field_stats[field] = 0
-                
-                field_stats[field] += 1
-        
-        with open(output_dir / "imputation_statistics.json", 'w') as f:
-            json.dump(field_stats, f, indent=2)
-        
-        # Save final checkpoint
-        checkpoint_path = Path(self.config['system']['checkpoint_dir']) / "imputation_final.ckpt"
-        save_checkpoint({
-            'imputed_values': self.imputed_values,
-            'processed_records': list(self.imputed_values.keys())
-        }, checkpoint_path)
-        
-        logger.info("Imputation results saved to %s", output_dir)
 
     def get_imputed_value(self, record_id, field):
         """
@@ -466,7 +463,7 @@ class Imputator:
         null_values = ['NULL', 'null', '', None, 'None', 'NA', 'N/A', 'none']
         
         # Known NULL hash values (add the hash you discovered)
-        null_hash_values = ['132172610905071792854514019103556680276']
+        null_hash_values = ['132172610905071792854514019103556680276', '289559475738986448570450700985395496420']
         
         # Count field hash frequencies to identify potential NULL values
         field_hash_counts = {}

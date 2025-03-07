@@ -167,11 +167,18 @@ class Embedder:
         field_hash_mapping = self._load_field_hash_mapping()
         
         # Filter strings to embed
+        # Filter strings to embed
         fields_to_embed = self.config['embedding']['fields_to_embed']
         strings_to_embed = {}
-        
-        logger.info("Filtering %d hashes to find strings to embed", len(hashes_to_process))
-        
+
+        logger.info(f"Filtering {len(hashes_to_process)} hashes to find strings to embed")
+        logger.info(f"Fields configured to embed: {fields_to_embed}")
+
+        # Sample a few entries from field_hash_mapping to debug
+        sample_entries = list(field_hash_mapping.items())[:3]
+        for hash_val, fields in sample_entries:
+            logger.info(f"Sample field_hash_mapping entry: {hash_val}: {fields}")
+
         for hash_value in tqdm(hashes_to_process, desc="Filtering strings"):
             # Skip if already processed
             if hash_value in processed_hashes:
@@ -179,8 +186,18 @@ class Embedder:
             
             # Look up in field hash mapping
             if hash_value in field_hash_mapping:
-                field_types = field_hash_mapping[hash_value].keys()
-                if any(field in fields_to_embed for field in field_types):
+                # This is the key fix - field_hash_mapping contains counts, not just field types
+                # So we need to check the keys of the field counts dictionary
+                field_types = list(field_hash_mapping[hash_value].keys())
+                
+                # Check if any of these field types should be embedded
+                should_embed = False
+                for field_type in field_types:
+                    if field_type in fields_to_embed:
+                        should_embed = True
+                        break
+                
+                if should_embed:
                     # Get the string value from unique strings
                     if self.use_mmap:
                         unique_strings_mmap = MMapDict(self.mmap_dir / "unique_strings.mmap")
@@ -371,41 +388,40 @@ class Embedder:
             logger.error("Error loading unique strings: %s", str(e))
             return {}
 
+    
     def _load_field_hash_mapping(self):
         """
-        Load field hash mapping with support for both original and enhanced preprocessor.
+        Load field hash mapping with direct file path.
         """
         try:
             output_dir = Path(self.config['system']['output_dir'])
             
-            # Try to load from index first (enhanced preprocessor)
-            index_path = output_dir / "field_hash_index.json"
-            if index_path.exists():
-                with open(index_path, 'r') as f:
-                    index = json.load(f)
-                
-                location = index.get('location')
-                
-                if location != "in-memory" and os.path.exists(location):
-                    # Load from memory-mapped file
-                    field_hash_mmap = MMapDict(location)
-                    
-                    # For field hash mapping, we can afford to materialize
-                    # since it's much smaller than the unique strings
-                    return field_hash_mmap.to_dict()
-                else:
-                    # Fall back to sample file
-                    with open(output_dir / "field_hash_mapping_sample.json", 'r') as f:
-                        return json.load(f)
-            else:
-                # Fall back to original approach
-                with open(output_dir / "field_hash_mapping_sample.json", 'r') as f:
+            # Try direct path first
+            direct_path = output_dir / "field_hash_mapping.json"
+            if direct_path.exists():
+                with open(direct_path, 'r') as f:
                     return json.load(f)
+            
+            # Fall back to field_hash_index.json
+            field_hash_path = output_dir / "field_hash_index.json"
+            if field_hash_path.exists():
+                with open(field_hash_path, 'r') as f:
+                    return json.load(f)
+            
+            # Fall back to sample
+            sample_path = output_dir / "field_hash_mapping_sample.json"
+            if sample_path.exists():
+                with open(sample_path, 'r') as f:
+                    return json.load(f)
+            
+            logger.error("No field hash mapping found!")
+            return {}
         
         except Exception as e:
-            logger.error("Error loading field hash mapping: %s", str(e))
+            logger.error(f"Error loading field hash mapping: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {}
-
     def _create_batches(self, strings_to_embed):
         """
         Organize strings into batches for embedding.
