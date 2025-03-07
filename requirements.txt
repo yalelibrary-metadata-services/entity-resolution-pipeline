@@ -1,0 +1,61 @@
+# Core dependencies
+numpy>=1.22.0
+pandas>=1.4.0
+scikit-learn>=1.1.0
+scipy>=1.8.0
+tqdm>=4.64.0
+pyyaml>=6.0
+joblib>=1.1.0
+psutil>=5.9.0
+tenacity
+
+# Weaviate client
+weaviate-client>=4.3.3
+
+# OpenAI API for embeddings
+openai>=1.7.0
+
+# String matching and text processing
+rapidfuzz>=2.10.0
+regex>=2022.3.15
+python-Levenshtein>=0.20.9
+cleantext>=1.1.4
+
+# Parallel processing
+ray>=2.5.1
+
+# Memory-mapped storage
+mmh3>=3.0.0
+diskcache>=5.4.0  # Added for efficient disk-based caching
+memory-profiler>=0.61.0
+
+# Graph operations and clustering
+networkx>=2.8.0
+community>=1.0.0b1
+python-louvain>=0.16
+
+# Visualization and reporting
+matplotlib>=3.5.1
+seaborn>=0.12.0
+plotly>=5.10.0
+tabulate>=0.9.0
+
+# Logging and monitoring
+prometheus-client>=0.16.0
+structlog>=22.1.0
+
+# Development and testing
+pytest>=7.0.0
+ipykernel>=6.15.0
+notebook>=6.4.12
+jupyter>=1.0.0
+ipywidgets>=8.0.0
+
+# File parsing and data manipulation
+pyarrow>=10.0.0
+
+# Memory optimization
+pympler>=1.0.1
+
+# Birth/death year detection
+# (referenced from birth_death_year_regexes.py)

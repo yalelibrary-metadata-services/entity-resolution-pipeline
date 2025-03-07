@@ -1,0 +1,72 @@
+flowchart LR
+    subgraph "Data Processing"
+        direction TB
+        A[Input CSV Files] --> B[batch_preprocessing.py]
+        B --> C[Unique Strings]
+        B --> D[Record Mappings]
+        B --> BD[Birth/Death Parser]
+        C --> E[embedding.py]
+        E --> F[Vector Embeddings]
+        F --> G[indexing.py]
+        G --> H[Weaviate Index]
+    end
+    
+    subgraph "Training"
+        direction TB
+        I[Ground Truth Data] --> J[parallel_features.py]
+        J --> K[Feature Vectors]
+        K --> L[classification.py]
+        L --> M[Logistic Regression Model]
+    end
+    
+    subgraph "Candidate Retrieval & Classification"
+        direction TB
+        N[Person IDs] --> O[batch_querying.py]
+        O --> P[Match Candidates]
+        P --> Q[Feature Extraction]
+        BD --> Q
+        Q --> R[Match Prediction]
+        R --> S[Match Pairs]
+    end
+    
+    subgraph "Clustering & Analysis"
+        direction TB
+        T[Match Pairs] --> U[clustering.py]
+        U --> V[Entity Graph]
+        V --> W[Community Detection]
+        W --> X[Entity Clusters]
+        X --> Y[analysis.py]
+        Y --> Z[Analysis Results]
+    end
+    
+    subgraph "Reporting & Visualization"
+        direction TB
+        Z --> RP[reporting.py]
+        RP --> AA[HTML Reports]
+        RP --> BB[Interactive Visualizations]
+        RP --> CC[CSV Reports]
+    end
+    
+    H -.-> O
+    D -.-> N
+    M -.-> R
+    S --> T
+    
+    %% External Services
+    OpenAI[OpenAI API] -.-> E
+    
+    %% Imputation Flow
+    IMP[imputation.py] -.-> Q
+    H -.-> IMP
+    
+    %% Pipeline Orchestration
+    PL[pipeline.py] -.-> B
+    PL -.-> E
+    PL -.-> G
+    PL -.-> IMP
+    PL -.-> O
+    PL -.-> J
+    PL -.-> L
+    PL -.-> U
+    PL -.-> Y
+    PL -.-> RP

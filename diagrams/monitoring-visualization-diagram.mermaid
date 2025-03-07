@@ -1,0 +1,60 @@
+flowchart TD
+    subgraph "Pipeline Execution"
+        P[pipeline.py] --> |Orchestrates| Components
+        Components --> |Emit Metrics| Metrics
+        Components --> |Generate| Results
+    end
+    
+    subgraph "Monitoring Infrastructure"
+        Metrics --> |Collected by| Prometheus[Prometheus]
+        Prometheus --> |Visualized in| Grafana[Grafana]
+    end
+    
+    subgraph "Analysis & Reporting System"
+        Results --> |Analyzed by| AN[analysis.py]
+        AN --> |Generates| AnalysisResults[Analysis Results]
+        AnalysisResults --> |Input to| RP[reporting.py]
+        RP --> |Creates| Reports
+    end
+    
+    subgraph "Reports"
+        Reports --> HTML[HTML Report]
+        Reports --> Visualizations
+        Reports --> CSV[CSV Exports]
+    end
+    
+    subgraph "Visualizations"
+        Visualizations --> FM[Feature Metrics]
+        Visualizations --> CM[Classification Metrics]
+        Visualizations --> CD[Cluster Distribution]
+        Visualizations --> PP[Pipeline Performance]
+    end
+    
+    subgraph "Interactive Analysis"
+        Results --> |Explored in| NB1[evaluation.ipynb]
+        Results --> |Explored in| NB2[exploration.ipynb]
+        NB1 --> |Generates| CustomViz[Custom Visualizations]
+        NB2 --> |Generates| ExploratoryAnalysis[Exploratory Analysis]
+    end
+    
+    %% Feature Metrics Visualizations
+    FM --> FM1[Feature Importance Barchart]
+    FM --> FM2[Feature Distribution Density Plots]
+    FM --> FM3[Feature Correlation Heatmap]
+    FM --> FM4[Feature Space t-SNE/PCA Plot]
+    
+    %% Classification Metrics Visualizations
+    CM --> CM1[Confusion Matrix Heatmap]
+    CM --> CM2[Precision-Recall Curve]
+    CM --> CM3[ROC Curve]
+    CM --> CM4[Classification Metrics Dashboard]
+    
+    %% Cluster Distribution Visualizations
+    CD --> CD1[Cluster Size Histogram]
+    CD --> CD2[Cluster Network Graphs]
+    CD --> CD3[Entity Relationship Diagram]
+    
+    %% Pipeline Performance Visualizations
+    PP --> PP1[Stage Duration Barchart]
+    PP --> PP2[Memory Usage Timeline]
+    PP --> PP3[Throughput Metrics]

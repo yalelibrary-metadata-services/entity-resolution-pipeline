@@ -1,0 +1,126 @@
+sequenceDiagram
+    participant User
+    participant Pipeline as pipeline.py
+    participant Preprocessor as batch_preprocessing.py
+    participant Embedder as embedding.py
+    participant OpenAI
+    participant Indexer as indexing.py
+    participant Weaviate
+    participant Imputator as imputation.py
+    participant QueryEngine as batch_querying.py
+    participant FeatureEngineer as parallel_features.py
+    participant BirthDeathParser as birth_death_year_regexes.py
+    participant Classifier as classification.py
+    participant Clusterer as clustering.py
+    participant Analyzer as analysis.py
+    participant Reporter as reporting.py
+    
+    User->>Pipeline: Execute pipeline
+    activate Pipeline
+    
+    %% Preprocessing Stage
+    Pipeline->>Preprocessor: Process input data (batched)
+    activate Preprocessor
+    Preprocessor->>Preprocessor: Parse CSV files in batches
+    Preprocessor->>Preprocessor: Deduplicate strings
+    Preprocessor->>Preprocessor: Compute field hashes
+    Preprocessor->>Preprocessor: Track string frequencies
+    Preprocessor->>BirthDeathParser: Extract birth/death years
+    BirthDeathParser-->>Preprocessor: Return extracted years
+    Preprocessor-->>Pipeline: Return preprocessing results
+    deactivate Preprocessor
+    
+    %% Embedding Stage
+    Pipeline->>Embedder: Generate embeddings (batched)
+    activate Embedder
+    Embedder->>Embedder: Check embedding cache
+    Embedder->>OpenAI: Request embeddings (rate-limited)
+    OpenAI-->>Embedder: Return embedding vectors
+    Embedder->>Embedder: Cache embeddings
+    Embedder-->>Pipeline: Return embeddings
+    deactivate Embedder
+    
+    %% Indexing Stage
+    Pipeline->>Indexer: Index embeddings (batched)
+    activate Indexer
+    Indexer->>Weaviate: Create/update collection with named vectors
+    Indexer->>Weaviate: Batch index vectors with field metadata
+    Weaviate-->>Indexer: Confirm indexing
+    Indexer-->>Pipeline: Return indexing status
+    deactivate Indexer
+    
+    %% Imputation Stage
+    Pipeline->>Imputator: Impute missing values
+    activate Imputator
+    Imputator->>Weaviate: Execute vector similarity search
+    Weaviate-->>Imputator: Return similar records
+    Imputator->>Imputator: Compute averages for missing fields
+    Imputator-->>Pipeline: Return imputation results
+    deactivate Imputator
+    
+    %% Query Stage
+    Pipeline->>QueryEngine: Find match candidates
+    activate QueryEngine
+    QueryEngine->>Weaviate: Execute ANN search with blocking
+    Weaviate-->>QueryEngine: Return candidate matches
+    QueryEngine-->>Pipeline: Return candidate pairs
+    deactivate QueryEngine
+    
+    %% Feature Engineering Stage
+    Pipeline->>FeatureEngineer: Extract features (parallel)
+    activate FeatureEngineer
+    FeatureEngineer->>QueryEngine: Query vectors for pairs
+    QueryEngine->>Weaviate: Execute vector retrieval
+    Weaviate-->>QueryEngine: Return vectors
+    QueryEngine-->>FeatureEngineer: Return vectors
+    FeatureEngineer->>BirthDeathParser: Parse birth/death years
+    BirthDeathParser-->>FeatureEngineer: Return temporal features
+    FeatureEngineer->>FeatureEngineer: Apply prefilters
+    FeatureEngineer->>FeatureEngineer: Compute similarity features
+    FeatureEngineer->>FeatureEngineer: Compute interaction features
+    FeatureEngineer-->>Pipeline: Return feature vectors
+    deactivate FeatureEngineer
+    
+    %% Classification Stage
+    Pipeline->>Classifier: Train/classify
+    activate Classifier
+    Classifier->>Classifier: Train on ground truth data
+    Classifier->>Classifier: Perform recursive feature elimination
+    Classifier->>Classifier: Evaluate model performance
+    Classifier->>Classifier: Classify candidate pairs
+    Classifier-->>Pipeline: Return match pairs
+    deactivate Classifier
+    
+    %% Clustering Stage
+    Pipeline->>Clusterer: Cluster matches
+    activate Clusterer
+    Clusterer->>Clusterer: Build entity graph
+    Clusterer->>Clusterer: Apply transitivity
+    Clusterer->>Clusterer: Apply community detection
+    Clusterer->>Clusterer: Resolve conflicts
+    Clusterer-->>Pipeline: Return entity clusters
+    deactivate Clusterer
+    
+    %% Analysis Stage
+    Pipeline->>Analyzer: Analyze results
+    activate Analyzer
+    Analyzer->>Analyzer: Analyze feature distributions
+    Analyzer->>Analyzer: Evaluate classification performance
+    Analyzer->>Analyzer: Analyze clustering results
+    Analyzer->>Analyzer: Find anomalies
+    Analyzer-->>Pipeline: Return analysis results
+    deactivate Analyzer
+    
+    %% Reporting Stage
+    Pipeline->>Reporter: Generate reports
+    activate Reporter
+    Reporter->>Reporter: Generate summary report
+    Reporter->>Reporter: Create feature visualizations
+    Reporter->>Reporter: Create classification visualizations
+    Reporter->>Reporter: Create clustering visualizations
+    Reporter->>Reporter: Generate comprehensive HTML report
+    Reporter-->>Pipeline: Return reporting status
+    deactivate Reporter
+    
+    Pipeline-->>User: Return completion status
+    deactivate Pipeline
