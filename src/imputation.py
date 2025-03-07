@@ -74,23 +74,12 @@ class Imputator:
         
         # Load record field hashes
         record_field_hashes = self._load_record_field_hashes()
+        logger.info(f"Loaded {len(record_field_hashes)} records total")
         
-        # Identify records with missing values
-        records_to_impute = {}
-        for record_id, field_hashes in record_field_hashes.items():
-            # Skip if already processed
-            if record_id in processed_records:
-                continue
-            
-            # Check if any field to impute is missing
-            missing_fields = [field for field in self.fields_to_impute 
-                             if field not in field_hashes or field_hashes[field] == 'NULL']
-            
-            if missing_fields:
-                records_to_impute[record_id] = missing_fields
+        # Identify records with missing values using enhanced detection that handles hash-based nulls
+        records_to_impute = self._identify_missing_values(record_field_hashes)
         
-        logger.info("Imputing values for %d/%d records", 
-                   len(records_to_impute), len(record_field_hashes))
+        logger.info(f"Imputing values for {len(records_to_impute)}/{len(record_field_hashes)} records")
         
         if self.config['system']['mode'] == 'dev':
             # In dev mode, limit the number of records to impute
@@ -183,7 +172,7 @@ class Imputator:
         }
         
         logger.info("Imputation completed: %d records imputed, %d fields, %.2f seconds",
-                   total_imputed, total_fields_imputed, timer.duration)
+                total_imputed, total_fields_imputed, timer.duration)
         
         return results
 
@@ -214,20 +203,56 @@ class Imputator:
 
     def _load_record_field_hashes(self):
         """
-        Load record field hashes from preprocessing results.
-        
-        Returns:
-            dict: Dictionary of record ID -> field hashes
+        Load record field hashes with support for full dataset.
         """
         try:
             output_dir = Path(self.config['system']['output_dir'])
-            with open(output_dir / "record_field_hashes_sample.json", 'r') as f:
-                record_field_hashes = json.load(f)
+            mmap_dir = Path(self.config['system']['temp_dir']) / "mmap"
             
-            return record_field_hashes
-        
+            # First try memory-mapped full dataset
+            mmap_path = mmap_dir / "record_field_hashes.mmap"
+            if mmap_path.exists():
+                from src.mmap_dict import MMapDict
+                record_field_hashes = MMapDict(mmap_path)
+                logger.info(f"Loaded FULL dataset: {len(record_field_hashes)} records from memory-mapped file")
+                return record_field_hashes
+                
+            # Next try record_index.json which points to the full dataset
+            record_index_path = output_dir / "record_index.json"
+            if record_index_path.exists():
+                with open(record_index_path, 'r') as f:
+                    record_index = json.load(f)
+                
+                location = record_index.get('location')
+                if location and location != "in-memory" and os.path.exists(location):
+                    from src.mmap_dict import MMapDict
+                    record_field_hashes = MMapDict(location)
+                    logger.info(f"Loaded FULL dataset: {len(record_field_hashes)} records from indexed location")
+                    return record_field_hashes
+                    
+            # Fall back to non-sample file if it exists
+            full_path = output_dir / "record_field_hashes.json"
+            if full_path.exists():
+                with open(full_path, 'r') as f:
+                    record_field_hashes = json.load(f)
+                logger.info(f"Loaded FULL dataset: {len(record_field_hashes)} records from JSON file")
+                return record_field_hashes
+                
+            # Finally, fall back to sample file with warning
+            sample_path = output_dir / "record_field_hashes_sample.json"
+            if sample_path.exists():
+                with open(sample_path, 'r') as f:
+                    record_field_hashes = json.load(f)
+                logger.warning(f"WARNING: Only found SAMPLE data with {len(record_field_hashes)} records. This is not the full dataset!")
+                return record_field_hashes
+                
+            logger.error("No record data found! Check preprocessing output.")
+            return {}
+            
         except Exception as e:
-            logger.error("Error loading record field hashes: %s", str(e))
+            logger.error(f"Error loading record field hashes: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {}
 
     def _get_vector_by_hash(self, hash_value, field_type):
@@ -284,14 +309,27 @@ class Imputator:
             # Create filter for field type
             field_filter = Filter.by_property("field_type").equal(field)
             
-            # Execute search using composite vector
-            results = collection.query.near_vector(
-                near_vector={"composite": query_vector},
-                filters=field_filter,
-                limit=self.max_candidates,
-                return_metadata=MetadataQuery(distance=True),
-                include_vector=True
-            )
+            if field == 'subjects':
+                # Execute search using composite vector
+                results = collection.query.near_vector(
+                    near_vector=query_vector,
+                    filters=field_filter,
+                    limit=self.max_candidates,
+                    return_metadata=MetadataQuery(distance=True),
+                    distance=0.3,
+                    target_vector=['subjects'],
+                    include_vector=True
+                )
+            else:
+                results = collection.query.near_vector(
+                    near_vector=query_vector,
+                    filters=field_filter,
+                    limit=self.max_candidates,
+                    return_metadata=MetadataQuery(distance=True),
+                    distance=0.3,
+                    target_vector=['provision'],
+                    include_vector=True
+                )
             
             if not results.objects:
                 logger.warning("No candidates found for field %s", field)
@@ -410,6 +448,94 @@ class Imputator:
             return self.imputed_values[record_id][field]
         
         return None
+
+    def _identify_missing_values(self, record_field_hashes):
+        """
+        Identify records with missing values with enhanced null detection
+        including known NULL hash values.
+        
+        Args:
+            record_field_hashes (dict): Dictionary of record ID -> field hashes
+            
+        Returns:
+            dict: Dictionary of record ID -> missing fields
+        """
+        records_to_impute = {}
+        
+        # List of possible null representations
+        null_values = ['NULL', 'null', '', None, 'None', 'NA', 'N/A', 'none']
+        
+        # Known NULL hash values (add the hash you discovered)
+        null_hash_values = ['132172610905071792854514019103556680276']
+        
+        # Count field hash frequencies to identify potential NULL values
+        field_hash_counts = {}
+        for field in self.fields_to_impute:
+            field_hash_counts[field] = {}
+        
+        # Count frequencies
+        for record_id, fields in record_field_hashes.items():
+            for field in self.fields_to_impute:
+                if field in fields:
+                    hash_value = fields[field]
+                    if hash_value not in field_hash_counts[field]:
+                        field_hash_counts[field][hash_value] = 0
+                    field_hash_counts[field][hash_value] += 1
+        
+        # Find most common hash values (potential NULL indicators)
+        for field, counts in field_hash_counts.items():
+            if counts:
+                sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+                most_common = sorted_counts[0]
+                logger.info(f"Most common hash value for {field}: {most_common[0]} (count: {most_common[1]})")
+                
+                # If a single hash value appears in more than 15% of records, it's likely a NULL value
+                if most_common[1] > len(record_field_hashes) * 0.15:
+                    logger.info(f"Potential NULL hash value detected for {field}: {most_common[0]}")
+                    if most_common[0] not in null_hash_values:
+                        null_hash_values.append(most_common[0])
+        
+        # Sample a few records to show what we're working with
+        sample_records = list(record_field_hashes.items())[:3]
+        for record_id, fields in sample_records:
+            logger.info(f"Sample record structure: {record_id}: {fields}")
+        
+        # Log the NULL hash values we're using
+        logger.info(f"Using the following hash values to identify NULLs: {null_hash_values}")
+        
+        # Now check each record
+        for record_id, field_hashes in record_field_hashes.items():
+            # Check if any field to impute is missing or has a null-like value
+            missing_fields = []
+            
+            for field in self.fields_to_impute:
+                # Check if field is missing
+                if field not in field_hashes:
+                    missing_fields.append(field)
+                    continue
+                    
+                # Check if field has a NULL hash value
+                if field_hashes[field] in null_hash_values:
+                    missing_fields.append(field)
+                    continue
+                    
+                # Check if field has a null-like string value
+                if isinstance(field_hashes[field], str) and field_hashes[field].lower() in null_values:
+                    missing_fields.append(field)
+                    continue
+            
+            if missing_fields:
+                records_to_impute[record_id] = missing_fields
+        
+        # Count how many records have missing values for each field
+        field_missing_counts = {}
+        for field in self.fields_to_impute:
+            field_missing_counts[field] = sum(1 for record_id, missing in records_to_impute.items() if field in missing)
+        
+        logger.info(f"Fields missing values: {field_missing_counts}")
+        logger.info(f"Found {len(records_to_impute)} records with missing values using enhanced null detection")
+        
+        return records_to_impute
 
     def __del__(self):
         """

@@ -88,6 +88,12 @@ class MMapDict:
         """Get item with default."""
         return self.data.get(key, default)
     
+    def update(self, other_dict):
+        """Update dictionary with key-value pairs from other_dict."""
+        for key, value in other_dict.items():
+            self.data[key] = value
+        self._dirty = True
+    
     def _load(self):
         """Load data from backing file."""
         try:
@@ -116,14 +122,18 @@ class MMapDict:
         Returns:
             dict: Regular dictionary containing the same data
         """
-        return dict(self.data)
+        result = {}
+        for key in self.keys():
+            value = self[key]
+            if hasattr(value, 'to_dict') and callable(getattr(value, 'to_dict')):
+                result[key] = value.to_dict()
+            elif isinstance(value, dict):
+                # Handle nested dictionaries
+                result[key] = {k: v for k, v in value.items()}
+            else:
+                result[key] = value
+        return result
     
-    def update(self, other_dict):
-        """Update dictionary with key-value pairs from other_dict."""
-        for key, value in other_dict.items():
-            self.data[key] = value
-        self._dirty = True
-
     def close(self):
         """Flush data and close."""
         self.flush()

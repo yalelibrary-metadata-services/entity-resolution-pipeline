@@ -703,22 +703,52 @@ class FeatureEngineer:
         except Exception as e:
             logger.error("Error saving checkpoint: %s", str(e))
 
+    # Add to src/parallel_features.py in the _save_results method
     def _save_results(self):
         """
-        Save feature engineering results.
+        Save feature engineering results with enhanced debugging.
         """
         output_dir = Path(self.config['system']['output_dir'])
         output_dir.mkdir(exist_ok=True)
         
-        # Save feature names
-        with open(output_dir / "feature_names.json", 'w') as f:
-            json.dump(self.feature_names, f, indent=2)
+        # Log where files are being saved
+        logger.info(f"Saving feature engineering results to directory: {output_dir}")
         
-        # Save feature vectors and labels
+        # Save feature names
+        feature_names_path = output_dir / "feature_names.json"
+        with open(feature_names_path, 'w') as f:
+            json.dump(self.feature_names, f, indent=2)
+        logger.info(f"Saved feature names to {feature_names_path}")
+        
+        # Save feature vectors and labels with path logging
         if self.use_mmap:
             # For memory-mapped storage, feature vectors and labels 
             # are already saved in numpy files
-            # Just create a reference file
+            logger.info(f"Using memory-mapped storage for feature vectors at: {self.feature_vectors_file}")
+            logger.info(f"Using memory-mapped storage for labels at: {self.labels_file}")
+            
+            # Copy memory-mapped data to standard location for compatibility
+            if self.feature_vectors_file.exists():
+                try:
+                    # Load from memory-mapped file
+                    feature_vectors = np.load(self.feature_vectors_file)
+                    # Save to standard location
+                    np.save(output_dir / "feature_vectors.npy", feature_vectors)
+                    logger.info(f"Copied feature vectors from {self.feature_vectors_file} to {output_dir / 'feature_vectors.npy'}")
+                except Exception as e:
+                    logger.error(f"Error copying feature vectors: {e}")
+            
+            if self.labels_file.exists():
+                try:
+                    # Load from memory-mapped file
+                    labels = np.load(self.labels_file)
+                    # Save to standard location
+                    np.save(output_dir / "labels.npy", labels)
+                    logger.info(f"Copied labels from {self.labels_file} to {output_dir / 'labels.npy'}")
+                except Exception as e:
+                    logger.error(f"Error copying labels: {e}")
+            
+            # Create reference file
             with open(output_dir / "feature_vectors_info.json", 'w') as f:
                 json.dump({
                     'count': self.feature_vectors_count,
@@ -726,43 +756,7 @@ class FeatureEngineer:
                     'feature_vectors_file': str(self.feature_vectors_file),
                     'labels_file': str(self.labels_file)
                 }, f, indent=2)
-            
-            # Create sample of prefiltered pairs for reference
-            prefiltered_true_sample = []
-            if self.prefiltered_true_file.exists():
-                with open(self.prefiltered_true_file, 'rb') as f:
-                    try:
-                        for _ in range(100):  # Get first 100 pairs
-                            pair = pickle.load(f)
-                            prefiltered_true_sample.append(pair)
-                    except EOFError:
-                        pass
-            
-            prefiltered_false_sample = []
-            if self.prefiltered_false_file.exists():
-                with open(self.prefiltered_false_file, 'rb') as f:
-                    try:
-                        for _ in range(100):  # Get first 100 pairs
-                            pair = pickle.load(f)
-                            prefiltered_false_sample.append(pair)
-                    except EOFError:
-                        pass
-            
-            # Save samples
-            with open(output_dir / "prefiltered_true_sample.json", 'w') as f:
-                json.dump(prefiltered_true_sample, f, indent=2)
-            
-            with open(output_dir / "prefiltered_false_sample.json", 'w') as f:
-                json.dump(prefiltered_false_sample, f, indent=2)
-            
-            # Save info about prefiltered pairs
-            with open(output_dir / "prefiltered_info.json", 'w') as f:
-                json.dump({
-                    'prefiltered_true_count': self.prefiltered_true_count,
-                    'prefiltered_false_count': self.prefiltered_false_count,
-                    'prefiltered_true_file': str(self.prefiltered_true_file),
-                    'prefiltered_false_file': str(self.prefiltered_false_file)
-                }, f, indent=2)
+            logger.info(f"Saved feature vectors info to {output_dir / 'feature_vectors_info.json'}")
         else:
             # For in-memory storage, save to numpy files
             feature_vectors_np = np.array(self.feature_vectors)
@@ -770,37 +764,8 @@ class FeatureEngineer:
             
             np.save(output_dir / "feature_vectors.npy", feature_vectors_np)
             np.save(output_dir / "labels.npy", labels_np)
-            
-            # Save prefiltered pairs
-            with open(output_dir / "prefiltered_true.json", 'w') as f:
-                json.dump(self.prefiltered_true, f, indent=2)
-            
-            with open(output_dir / "prefiltered_false.json", 'w') as f:
-                json.dump(self.prefiltered_false, f, indent=2)
-        
-        # Save statistics
-        if self.use_mmap:
-            feature_count = self.feature_vectors_count
-            prefiltered_true_count = self.prefiltered_true_count
-            prefiltered_false_count = self.prefiltered_false_count
-        else:
-            feature_count = len(self.feature_vectors)
-            prefiltered_true_count = len(self.prefiltered_true)
-            prefiltered_false_count = len(self.prefiltered_false)
-        
-        stats = {
-            'total_vectors': feature_count,
-            'positive_examples': sum(self.labels) if not self.use_mmap else 'unknown',
-            'negative_examples': len(self.labels) - sum(self.labels) if not self.use_mmap else 'unknown',
-            'prefiltered_true': prefiltered_true_count,
-            'prefiltered_false': prefiltered_false_count,
-            'feature_count': len(self.feature_names)
-        }
-        
-        with open(output_dir / "feature_statistics.json", 'w') as f:
-            json.dump(stats, f, indent=2)
-        
-        logger.info("Feature engineering results saved to %s", output_dir)
+            logger.info(f"Saved feature vectors to {output_dir / 'feature_vectors.npy'}, shape={feature_vectors_np.shape}")
+            logger.info(f"Saved labels to {output_dir / 'labels.npy'}, shape={labels_np.shape}")
     
     def _find_records_by_hash(self, hash_value, field_type, record_field_hashes):
         """

@@ -60,7 +60,7 @@ imputation:
   fields_to_impute:
     - "provision"
     - "subjects"
-  vector_similarity_threshold: 0.70  # Minimum similarity for imputation
+  vector_similarity_threshold: 0.30  # Minimum similarity for imputation
   max_candidates: 10  # Number of candidates to consider for imputation
   imputation_method: "average"  # average, weighted_average, nearest
 

@@ -200,51 +200,101 @@ class Classifier:
         
         return results
 
+    # Update src/classification.py to handle both storage types
     def _load_features(self):
         """
         Load feature vectors and labels with enhanced error handling.
-        
-        Returns:
-            tuple: (feature_vectors, labels, feature_names)
         """
         try:
             output_dir = Path(self.config['system']['output_dir'])
+            mmap_dir = Path(self.config['system']['temp_dir']) / "mmap"
             
-            # Check if files exist and log their status
-            feature_vectors_path = output_dir / "feature_vectors.npy"
-            labels_path = output_dir / "labels.npy"
-            feature_names_path = output_dir / "feature_names.json"
+            # Try multiple approaches to find feature vectors
+            feature_vectors = None
+            labels = None
             
-            logger.info(f"Looking for feature vectors at: {feature_vectors_path}")
-            logger.info(f"Feature vectors file exists: {feature_vectors_path.exists()}")
+            # Approach 1: Standard numpy files in output dir
+            standard_feature_path = output_dir / "feature_vectors.npy"
+            standard_labels_path = output_dir / "labels.npy"
             
-            if feature_vectors_path.exists():
-                logger.info(f"Feature vectors file size: {feature_vectors_path.stat().st_size} bytes")
+            if standard_feature_path.exists() and standard_labels_path.exists():
+                logger.info(f"Loading feature vectors from standard path: {standard_feature_path}")
+                feature_vectors = np.load(standard_feature_path)
+                labels = np.load(standard_labels_path)
             
-            # Load feature vectors
-            if feature_vectors_path.exists() and feature_vectors_path.stat().st_size > 0:
-                feature_vectors = np.load(feature_vectors_path)
-                logger.info(f"Loaded feature vectors with shape: {feature_vectors.shape}")
-            else:
-                logger.warning(f"Feature vectors file not found or empty: {feature_vectors_path}")
-                return np.array([]), np.array([]), []
+            # Approach 2: Check feature vectors info for memory-mapped files
+            info_path = output_dir / "feature_vectors_info.json"
+            if feature_vectors is None and info_path.exists():
+                logger.info(f"Found feature vectors info at: {info_path}")
+                with open(info_path, 'r') as f:
+                    info = json.load(f)
+                
+                feature_vectors_file = info.get('feature_vectors_file')
+                labels_file = info.get('labels_file')
+                
+                if feature_vectors_file and Path(feature_vectors_file).exists():
+                    logger.info(f"Loading feature vectors from memory-mapped file: {feature_vectors_file}")
+                    feature_vectors = np.load(feature_vectors_file)
+                
+                if labels_file and Path(labels_file).exists():
+                    logger.info(f"Loading labels from memory-mapped file: {labels_file}")
+                    labels = np.load(labels_file)
             
-            # Load labels
-            if labels_path.exists() and labels_path.stat().st_size > 0:
-                labels = np.load(labels_path)
-                logger.info(f"Loaded labels with shape: {labels.shape}")
-            else:
-                logger.warning(f"Labels file not found or empty: {labels_path}")
-                return feature_vectors, np.array([]), []
+            # Approach 3: Check memory-mapped files directly
+            mmap_feature_file = mmap_dir / "feature_vectors.mmap"
+            mmap_labels_file = mmap_dir / "labels.mmap"
+            
+            if feature_vectors is None and mmap_feature_file.exists():
+                logger.info(f"Loading feature vectors from memory-mapped file: {mmap_feature_file}")
+                try:
+                    # Try to load as numpy memory-mapped array
+                    feature_vectors = np.memmap(mmap_feature_file, mode='r')
+                    # Try to reshape if necessary
+                    if feature_vectors.ndim == 1:
+                        # Try to guess dimensions based on feature names
+                        feature_names_path = output_dir / "feature_names.json"
+                        if feature_names_path.exists():
+                            with open(feature_names_path, 'r') as f:
+                                feature_names = json.load(f)
+                            num_features = len(feature_names)
+                            # Reshape assuming row-major order
+                            total_elements = feature_vectors.size
+                            num_vectors = total_elements // num_features
+                            if num_vectors * num_features == total_elements:
+                                feature_vectors = feature_vectors.reshape(num_vectors, num_features)
+                except Exception as e:
+                    logger.error(f"Error loading memory-mapped feature vectors: {e}")
+                    feature_vectors = None
             
             # Load feature names
+            feature_names_path = output_dir / "feature_names.json"
             if feature_names_path.exists():
                 with open(feature_names_path, 'r') as f:
                     feature_names = json.load(f)
                 logger.info(f"Loaded {len(feature_names)} feature names")
             else:
                 logger.warning(f"Feature names file not found: {feature_names_path}")
-                feature_names = [f"feature_{i}" for i in range(feature_vectors.shape[1])]
+                # Create default feature names if needed and feature vectors exist
+                if feature_vectors is not None and feature_vectors.ndim > 1:
+                    feature_names = [f"feature_{i}" for i in range(feature_vectors.shape[1])]
+                else:
+                    feature_names = []
+            
+            # Ensure we have arrays
+            if feature_vectors is None:
+                logger.warning("Could not find feature vectors in any location")
+                feature_vectors = np.array([])
+            
+            if labels is None:
+                logger.warning("Could not find labels in any location")
+                labels = np.array([])
+            
+            # Log shapes
+            if isinstance(feature_vectors, np.ndarray):
+                logger.info(f"Loaded feature vectors with shape: {feature_vectors.shape}")
+            
+            if isinstance(labels, np.ndarray):
+                logger.info(f"Loaded labels with shape: {labels.shape}")
             
             return feature_vectors, labels, feature_names
         

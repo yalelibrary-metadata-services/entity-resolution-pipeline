@@ -177,6 +177,104 @@ class Preprocessor:
         
         return results
 
+    def _save_results(self):
+        """
+        Save preprocessing results in a scalable way.
+        """
+        output_dir = Path(self.config['system']['output_dir'])
+        output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Helper function to convert MMapDict to regular dict
+        def convert_to_regular_dict(mmap_dict):
+            if not isinstance(mmap_dict, dict) and not hasattr(mmap_dict, 'items'):
+                return mmap_dict
+            
+            regular_dict = {}
+            for k, v in mmap_dict.items():
+                if isinstance(v, dict) or hasattr(v, 'items'):
+                    regular_dict[k] = convert_to_regular_dict(v)
+                else:
+                    regular_dict[k] = v
+            return regular_dict
+        
+        # Create a lightweight index file that contains references
+        # to memory-mapped data rather than copying everything
+        
+        # Save unique strings index
+        unique_strings_index = {
+            'count': len(self.unique_strings),
+            'location': str(self.mmap_dir / "unique_strings.mmap") if self.use_mmap else "in-memory",
+            'sample': convert_to_regular_dict({k: self.unique_strings[k] for k in list(self.unique_strings.keys())[:100]})
+        }
+        with open(output_dir / "unique_strings_index.json", 'w') as f:
+            json.dump(unique_strings_index, f)
+        
+        # Save string counts index
+        string_counts_index = {
+            'count': len(self.string_counts),
+            'location': str(self.mmap_dir / "string_counts.mmap") if self.use_mmap else "in-memory",
+            'sample': convert_to_regular_dict({k: self.string_counts[k] for k in list(self.string_counts.keys())[:100]})
+        }
+        with open(output_dir / "string_counts_index.json", 'w') as f:
+            json.dump(string_counts_index, f)
+        
+        # Save record field hashes index
+        record_index = {
+            'count': len(self.record_field_hashes),
+            'location': str(self.mmap_dir / "record_field_hashes.mmap") if self.use_mmap else "in-memory",
+            'sample': convert_to_regular_dict({k: self.record_field_hashes[k] for k in list(self.record_field_hashes.keys())[:100]})
+        }
+        with open(output_dir / "record_index.json", 'w') as f:
+            json.dump(record_index, f)
+        
+        # Save field hash mapping index
+        field_hash_index = {
+            'count': len(self.field_hash_mapping),
+            'location': str(self.mmap_dir / "field_hash_mapping.mmap") if self.use_mmap else "in-memory",
+            'sample': convert_to_regular_dict({k: self.field_hash_mapping[k] for k in list(self.field_hash_mapping.keys())[:100]})
+        }
+        with open(output_dir / "field_hash_index.json", 'w') as f:
+            json.dump(field_hash_index, f)
+        
+        # Additionally, save FULL data to JSON for direct access by downstream components
+        # This is essential for smaller datasets or components that don't support memory-mapped files
+        if len(self.record_field_hashes) < 10000:  # Only for reasonably sized datasets
+            full_dict = convert_to_regular_dict(self.record_field_hashes)
+            with open(output_dir / "record_field_hashes.json", 'w') as f:
+                json.dump(full_dict, f)
+            logger.info(f"Saved FULL record data ({len(self.record_field_hashes)} records) to JSON for direct access")
+        
+        # Save samples for reference and compatibility
+        unique_strings_sample = convert_to_regular_dict({k: self.unique_strings[k] for k in list(self.unique_strings.keys())[:1000]})
+        with open(output_dir / "unique_strings_sample.json", 'w') as f:
+            json.dump(unique_strings_sample, f)
+        
+        string_counts_sample = convert_to_regular_dict({k: self.string_counts[k] for k in list(self.string_counts.keys())[:1000]})
+        with open(output_dir / "string_counts_sample.json", 'w') as f:
+            json.dump(string_counts_sample, f)
+        
+        field_hash_mapping_sample = convert_to_regular_dict({k: self.field_hash_mapping[k] for k in list(self.field_hash_mapping.keys())[:1000]})
+        with open(output_dir / "field_hash_mapping_sample.json", 'w') as f:
+            json.dump(field_hash_mapping_sample, f)
+        
+        record_field_hashes_sample = convert_to_regular_dict({k: self.record_field_hashes[k] for k in list(self.record_field_hashes.keys())[:1000]})
+        with open(output_dir / "record_field_hashes_sample.json", 'w') as f:
+            json.dump(record_field_hashes_sample, f)
+        
+        # For large datasets, create a memory-mapped numpy array to store the hashes
+        # This will allow efficient access to the hashes for embedding
+        if self.use_mmap and len(self.unique_strings) > 10000:
+            self._create_hash_array()
+        
+        # Flush memory-mapped dictionaries
+        if self.use_mmap:
+            self.unique_strings.flush()
+            self.string_counts.flush()
+            self.record_field_hashes.flush()
+            self.field_hash_mapping.flush()
+        
+        logger.info(f"Preprocessing results saved to {output_dir}")
+
     def _read_file_in_batches(self, file_path, batch_size):
         """
         Read CSV file in efficient batches using pandas.
@@ -213,8 +311,8 @@ class Preprocessor:
             for field in ['composite', 'person', 'roles', 'title', 'provision', 'subjects']:
                 value = record.get(field, '')
                 
-                # Handle null values
-                if not value or value == 0.0:
+                # Handle null values - make sure empty strings are marked as NULL
+                if value is None or value == '' or value == 0.0:
                     field_hashes[field] = 'NULL'
                     continue
                 
@@ -249,6 +347,7 @@ class Preprocessor:
             'record_field_hashes': batch_record_field_hashes,
             'field_hash_mapping': batch_field_hash_mapping
         }
+
 
     def _update_data_structures(self, batch_data):
         """
@@ -303,83 +402,59 @@ class Preprocessor:
         # MurmurHash is much faster than MD5/SHA and has low collision rate
         return str(mmh3.hash128(text))
 
-    def _save_results(self):
+    def _load_record_field_hashes(self):
         """
-        Save preprocessing results in a scalable way.
+        Load record field hashes with support for full dataset.
         """
-        output_dir = Path(self.config['system']['output_dir'])
-        output_dir.mkdir(exist_ok=True, parents=True)
-        
-        # Create a lightweight index file that contains references
-        # to memory-mapped data rather than copying everything
-        
-        # Save unique strings index
-        unique_strings_index = {
-            'count': len(self.unique_strings),
-            'location': str(self.mmap_dir / "unique_strings.mmap") if self.use_mmap else "in-memory",
-            'sample': {k: self.unique_strings[k] for k in list(self.unique_strings.keys())[:100]}
-        }
-        with open(output_dir / "unique_strings_index.json", 'w') as f:
-            json.dump(unique_strings_index, f)
-        
-        # Save string counts index
-        string_counts_index = {
-            'count': len(self.string_counts),
-            'location': str(self.mmap_dir / "string_counts.mmap") if self.use_mmap else "in-memory",
-            'sample': {k: self.string_counts[k] for k in list(self.string_counts.keys())[:100]}
-        }
-        with open(output_dir / "string_counts_index.json", 'w') as f:
-            json.dump(string_counts_index, f)
-        
-        # Save record field hashes index
-        record_index = {
-            'count': len(self.record_field_hashes),
-            'location': str(self.mmap_dir / "record_field_hashes.mmap") if self.use_mmap else "in-memory",
-            'sample': {k: self.record_field_hashes[k] for k in list(self.record_field_hashes.keys())[:100]}
-        }
-        with open(output_dir / "record_index.json", 'w') as f:
-            json.dump(record_index, f)
-        
-        # Save field hash mapping index
-        field_hash_index = {
-            'count': len(self.field_hash_mapping),
-            'location': str(self.mmap_dir / "field_hash_mapping.mmap") if self.use_mmap else "in-memory",
-            'sample': {k: self.field_hash_mapping[k] for k in list(self.field_hash_mapping.keys())[:100]}
-        }
-        with open(output_dir / "field_hash_index.json", 'w') as f:
-            json.dump(field_hash_index, f)
-        
-        # Additionally, save full samples for compatibility with downstream components
-        # that expect these files
-        unique_strings_sample = {k: self.unique_strings[k] for k in list(self.unique_strings.keys())[:1000]}
-        with open(output_dir / "unique_strings_sample.json", 'w') as f:
-            json.dump(unique_strings_sample, f)
-        
-        string_counts_sample = {k: self.string_counts[k] for k in list(self.string_counts.keys())[:1000]}
-        with open(output_dir / "string_counts_sample.json", 'w') as f:
-            json.dump(string_counts_sample, f)
-        
-        field_hash_mapping_sample = {k: self.field_hash_mapping[k] for k in list(self.field_hash_mapping.keys())[:1000]}
-        with open(output_dir / "field_hash_mapping_sample.json", 'w') as f:
-            json.dump(field_hash_mapping_sample, f)
-        
-        record_field_hashes_sample = {k: self.record_field_hashes[k] for k in list(self.record_field_hashes.keys())[:1000]}
-        with open(output_dir / "record_field_hashes_sample.json", 'w') as f:
-            json.dump(record_field_hashes_sample, f)
-        
-        # For large datasets, create a memory-mapped numpy array to store the hashes
-        # This will allow efficient access to the hashes for embedding
-        if self.use_mmap and len(self.unique_strings) > 10000:
-            self._create_hash_array()
-        
-        # Flush memory-mapped dictionaries
-        if self.use_mmap:
-            self.unique_strings.flush()
-            self.string_counts.flush()
-            self.record_field_hashes.flush()
-            self.field_hash_mapping.flush()
-        
-        logger.info("Preprocessing results saved to %s", output_dir)
+        try:
+            output_dir = Path(self.config['system']['output_dir'])
+            mmap_dir = Path(self.config['system']['temp_dir']) / "mmap"
+            
+            # First try memory-mapped full dataset
+            mmap_path = mmap_dir / "record_field_hashes.mmap"
+            if mmap_path.exists():
+                from src.mmap_dict import MMapDict
+                record_field_hashes = MMapDict(mmap_path)
+                logger.info(f"Loaded FULL dataset: {len(record_field_hashes)} records from memory-mapped file")
+                return record_field_hashes
+                
+            # Next try record_index.json which points to the full dataset
+            record_index_path = output_dir / "record_index.json"
+            if record_index_path.exists():
+                with open(record_index_path, 'r') as f:
+                    record_index = json.load(f)
+                
+                location = record_index.get('location')
+                if location and location != "in-memory" and os.path.exists(location):
+                    from src.mmap_dict import MMapDict
+                    record_field_hashes = MMapDict(location)
+                    logger.info(f"Loaded FULL dataset: {len(record_field_hashes)} records from indexed location")
+                    return record_field_hashes
+                    
+            # Fall back to non-sample file if it exists
+            full_path = output_dir / "record_field_hashes.json"
+            if full_path.exists():
+                with open(full_path, 'r') as f:
+                    record_field_hashes = json.load(f)
+                logger.info(f"Loaded FULL dataset: {len(record_field_hashes)} records from JSON file")
+                return record_field_hashes
+                
+            # Finally, fall back to sample file with warning
+            sample_path = output_dir / "record_field_hashes_sample.json"
+            if sample_path.exists():
+                with open(sample_path, 'r') as f:
+                    record_field_hashes = json.load(f)
+                logger.warning(f"WARNING: Only found SAMPLE data with {len(record_field_hashes)} records. This is not the full dataset!")
+                return record_field_hashes
+                
+            logger.error("No record data found! Check preprocessing output.")
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Error loading record field hashes: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {}
 
     def _create_hash_array(self):
         """
