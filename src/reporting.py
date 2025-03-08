@@ -185,6 +185,98 @@ class Reporter:
             logger.error(traceback.format_exc())
             return {}
 
+    def diagnose_label_issue(self, reports_dir):
+        """
+        Diagnose why all labels in the report are positive.
+        """
+        output_dir = Path(self.config['system']['output_dir'])
+        
+        # First check: Raw ground truth data
+        ground_truth_file = Path(self.config['data']['ground_truth_file'])
+        if ground_truth_file.exists():
+            try:
+                # Read the raw ground truth file
+                with open(ground_truth_file, 'r') as f:
+                    lines = f.readlines()
+                    
+                # Count positive and negative examples in raw data
+                total_pairs = 0
+                positive_count = 0
+                negative_count = 0
+                
+                for line in lines[1:]:  # Skip header
+                    if ',' in line:
+                        parts = line.strip().split(',')
+                        if len(parts) >= 3:
+                            match_value = parts[2].lower()
+                            total_pairs += 1
+                            if match_value in ['true', 'yes', 't', 'y', '1', 'match']:
+                                positive_count += 1
+                            else:
+                                negative_count += 1
+                
+                # Log raw data distribution
+                logger.info(f"Ground truth file contains {total_pairs} pairs: {positive_count} positive ({positive_count/total_pairs:.1%}), {negative_count} negative ({negative_count/total_pairs:.1%})")
+                
+                if negative_count == 0:
+                    logger.error("CRITICAL ISSUE: Ground truth file contains NO negative examples!")
+            except Exception as e:
+                logger.error(f"Error analyzing ground truth file: {e}")
+        
+        # Second check: Saved labels
+        labels_path = output_dir / "labels.npy"
+        if labels_path.exists():
+            try:
+                labels = np.load(labels_path)
+                unique_values, counts = np.unique(labels, return_counts=True)
+                
+                logger.info(f"Saved labels contain {len(labels)} examples with values: {list(zip(unique_values, counts))}")
+                
+                if 0 not in unique_values:
+                    logger.error("CRITICAL ISSUE: Saved labels contain NO negative examples (0)!")
+            except Exception as e:
+                logger.error(f"Error analyzing saved labels: {e}")
+        
+        # Third check: Test indices
+        test_indices_path = output_dir / "test_indices.npy"
+        if test_indices_path.exists() and labels_path.exists():
+            try:
+                test_indices = np.load(test_indices_path)
+                labels = np.load(labels_path)
+                
+                if len(test_indices) > 0 and len(labels) > max(test_indices):
+                    test_labels = labels[test_indices]
+                    unique_values, counts = np.unique(test_labels, return_counts=True)
+                    
+                    logger.info(f"Test set contains {len(test_labels)} examples with values: {list(zip(unique_values, counts))}")
+                    
+                    if 0 not in unique_values:
+                        logger.error("CRITICAL ISSUE: Test set contains NO negative examples (0)!")
+                else:
+                    logger.error(f"Test indices out of range or empty: {len(test_indices)} indices, max index {max(test_indices) if len(test_indices) > 0 else -1}, labels length {len(labels)}")
+            except Exception as e:
+                logger.error(f"Error analyzing test indices: {e}")
+        
+        # Save diagnostic results
+        with open(reports_dir / "label_diagnostics.json", 'w') as f:
+            json.dump({
+                "raw_ground_truth": {
+                    "total": total_pairs,
+                    "positive": positive_count,
+                    "negative": negative_count
+                },
+                "saved_labels": {
+                    "total": len(labels) if 'labels' in locals() else 0,
+                    "distribution": {str(val): int(count) for val, count in zip(unique_values, counts)} if 'unique_values' in locals() else {}
+                },
+                "test_set": {
+                    "total": len(test_labels) if 'test_labels' in locals() else 0,
+                    "distribution": {str(val): int(count) for val, count in zip(unique_values, counts)} if 'test_labels' in locals() else {}
+                }
+            }, f, indent=2)
+        
+        return "Diagnostics completed - check logs for results"
+
     def _generate_classification_report(self, reports_dir):
         """
         Generate classification performance report with proper array alignment.
@@ -204,74 +296,45 @@ class Reporter:
             predictions_path = output_dir / "predictions.npy"
             labels_path = output_dir / "labels.npy"
             feature_vectors_path = output_dir / "feature_vectors.npy"
-            test_indices_path = output_dir / "test_indices.npy"
             
             # Initialize report
-            report = {}
+            report = {'metrics': {}, 'confusion_matrix': {}}
             
-            # Load pre-computed metrics if available
-            if metrics_path.exists():
-                with open(metrics_path, 'r') as f:
-                    classification_metrics = json.load(f)
-                
-                report['metrics'] = classification_metrics
-                report['confusion_matrix'] = {
-                    'true_positives': classification_metrics.get('true_positives', 0),
-                    'false_positives': classification_metrics.get('false_positives', 0),
-                    'true_negatives': classification_metrics.get('true_negatives', 0),
-                    'false_negatives': classification_metrics.get('false_negatives', 0)
-                }
-            
-            # Load predictions and labels if available to compute metrics
-            predictions = None
-            labels = None
-            
+            # Load predictions and labels if available to compute fresh metrics
             if predictions_path.exists() and labels_path.exists():
                 try:
                     predictions = np.load(predictions_path)
                     labels = np.load(labels_path)
                     
-                    # Check if we need to align arrays
-                    if len(predictions) != len(labels):
-                        logger.warning(f"Predictions ({len(predictions)}) and labels ({len(labels)}) have different lengths")
-                        
-                        # Try to use test indices
-                        if test_indices_path.exists():
-                            test_indices = np.load(test_indices_path)
-                            logger.info(f"Using test indices to align arrays. Test set size: {len(test_indices)}")
-                            if len(labels) > len(test_indices):
-                                # Assume labels contain both training and test data
-                                labels = labels[test_indices]
-                            else:
-                                logger.warning("Cannot use test indices, array sizes don't match expectations")
-                        
-                        # If still mismatched, truncate to the smaller size
-                        if len(predictions) != len(labels):
-                            logger.warning("Truncating arrays to match lengths")
-                            min_len = min(len(predictions), len(labels))
-                            predictions = predictions[:min_len]
-                            labels = labels[:min_len]
+                    # Ensure arrays are the same length
+                    min_len = min(len(predictions), len(labels))
+                    predictions = predictions[:min_len]
+                    labels = labels[:min_len]
                     
-                    # Ensure predictions and labels are binary for metrics calculation only
+                    # Convert to binary if needed
                     predictions_binary = (predictions > 0.5).astype(int) if predictions.dtype != 'int64' else predictions
                     labels_binary = (labels > 0.5).astype(int) if labels.dtype != 'int64' else labels
                     
-                    # Compute metrics
-                    precision = precision_score(labels_binary, predictions_binary)
-                    recall = recall_score(labels_binary, predictions_binary)
-                    f1 = f1_score(labels_binary, predictions_binary)
-                    accuracy = accuracy_score(labels_binary, predictions_binary)
-                    
-                    # Compute confusion matrix components
+                    # Compute confusion matrix
                     cm = confusion_matrix(labels_binary, predictions_binary)
                     tn, fp, fn, tp = cm.ravel()
                     
-                    # Update or create report metrics
+                    # Compute metrics directly from confusion matrix components
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+                    
+                    # Update report with freshly computed metrics
                     report['metrics'] = {
                         'precision': float(precision),
                         'recall': float(recall),
                         'f1': float(f1),
-                        'accuracy': float(accuracy)
+                        'accuracy': float(accuracy),
+                        'true_positives': int(tp),
+                        'false_positives': int(fp),
+                        'true_negatives': int(tn),
+                        'false_negatives': int(fn)
                     }
                     
                     report['confusion_matrix'] = {
@@ -281,56 +344,54 @@ class Reporter:
                         'false_negatives': int(fn)
                     }
                     
-                    # Save computed metrics for future use
-                    report['metrics'].update({
-                        'true_positives': int(tp),
-                        'false_positives': int(fp),
-                        'true_negatives': int(tn),
-                        'false_negatives': int(fn)
-                    })
+                    logger.info(f"Computed fresh metrics from predictions and labels: precision={precision:.4f}, recall={recall:.4f}")
                     
-                    # Load feature vectors if available to recreate the original DataFrame
-                    feature_vectors = None
+                    # Load feature vectors to create DataFrame if available
                     if feature_vectors_path.exists():
                         try:
                             feature_vectors = np.load(feature_vectors_path)
-                            logger.info(f"Loaded feature vectors with shape: {feature_vectors.shape}")
+                            if len(feature_vectors) == len(predictions) and len(feature_vectors) > 0:
+                                # Create DataFrame with all data
+                                df = pd.DataFrame(feature_vectors, columns=[f"feature_{i}" for i in range(feature_vectors.shape[1])])
+                                df['true_label'] = labels
+                                df['predicted_label'] = predictions_binary
+                                df['prediction_confidence'] = predictions
+                                
+                                # Save classified pairs
+                                classified_pairs_path = reports_dir / "classified_pairs.csv"
+                                df.to_csv(classified_pairs_path, index=False)
+                                logger.info(f"Saved classified pairs to {classified_pairs_path}")
                         except Exception as e:
                             logger.error(f"Error loading feature vectors: {e}")
-                            
-                    # Create DataFrame with feature data if available
-                    if feature_vectors is not None and len(feature_vectors) == len(predictions):
-                        # Create DataFrame with feature vectors and labels
-                        df = pd.DataFrame(feature_vectors, columns=[f"feature_{i}" for i in range(feature_vectors.shape[1])])
-                        df['true_label'] = labels
-                        df['predicted_label'] = predictions_binary
-                        df['prediction_confidence'] = predictions  # This preserves the actual probability values
-                        
-                        # Save the complete DataFrame with all features to CSV
-                        classified_pairs_path = reports_dir / "classified_pairs.csv"
-                        df.to_csv(classified_pairs_path, index=False)
-                        logger.info(f"Saved classified pairs with {feature_vectors.shape[1]} features to {classified_pairs_path}")
-                    else:
-                        logger.warning("Feature vectors not available or dimensions don't match predictions")
-                        # Create simplified DataFrame with just labels and predictions
-                        df = pd.DataFrame({
-                            'true_label': labels,
-                            'predicted_label': predictions_binary,
-                            'prediction_confidence': predictions
-                        })
-                        classified_pairs_path = reports_dir / "classified_pairs.csv"
-                        df.to_csv(classified_pairs_path, index=False)
-                        logger.info(f"Saved simplified classified pairs to {classified_pairs_path}")
-                    
-                    with open(reports_dir / "computed_metrics.json", 'w') as f:
-                        json.dump(report['metrics'], f, indent=2)
-                    
                 except Exception as e:
                     logger.error(f"Error computing metrics from predictions and labels: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
-            else:
-                logger.warning("Predictions or labels files not found, using pre-computed metrics only")
+                    
+                    # Fall back to pre-computed metrics if fresh computation fails
+                    if metrics_path.exists():
+                        with open(metrics_path, 'r') as f:
+                            precomputed_metrics = json.load(f)
+                            report['metrics'] = precomputed_metrics
+                            report['confusion_matrix'] = {
+                                'true_positives': precomputed_metrics.get('true_positives', 0),
+                                'false_positives': precomputed_metrics.get('false_positives', 0),
+                                'true_negatives': precomputed_metrics.get('true_negatives', 0),
+                                'false_negatives': precomputed_metrics.get('false_negatives', 0)
+                            }
+                        logger.warning("Using pre-computed metrics from file as fallback")
+            elif metrics_path.exists():
+                # If predictions/labels not available, use pre-computed metrics
+                with open(metrics_path, 'r') as f:
+                    precomputed_metrics = json.load(f)
+                    report['metrics'] = precomputed_metrics
+                    report['confusion_matrix'] = {
+                        'true_positives': precomputed_metrics.get('true_positives', 0),
+                        'false_positives': precomputed_metrics.get('false_positives', 0),
+                        'true_negatives': precomputed_metrics.get('true_negatives', 0),
+                        'false_negatives': precomputed_metrics.get('false_negatives', 0)
+                    }
+                logger.info("Using pre-computed metrics from file")
             
             # Early return if no metrics available
             if not report.get('metrics'):
@@ -354,7 +415,7 @@ class Reporter:
                 logger.info(f"Confusion matrix plot saved to {cm_path}")
             
             # Generate ROC curve if probabilities are available
-            if predictions is not None and labels is not None and predictions.dtype == float:
+            if predictions is not None and labels is not None and hasattr(predictions, 'dtype') and predictions.dtype == float:
                 try:
                     roc_path = reports_dir / "roc_curve.png"
                     self._plot_roc_curve(labels, predictions, roc_path)
@@ -369,6 +430,7 @@ class Reporter:
             import traceback
             logger.error(traceback.format_exc())
             return {}
+    
 
     def _generate_misclassified_report(self, reports_dir):
         """

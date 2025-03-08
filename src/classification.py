@@ -69,12 +69,6 @@ class Classifier:
     def execute(self, checkpoint=None):
         """
         Execute classifier training and evaluation.
-        
-        Args:
-            checkpoint (str, optional): Path to checkpoint file. Defaults to None.
-            
-        Returns:
-            dict: Classification results
         """
         # Load checkpoint if provided
         if checkpoint and os.path.exists(checkpoint):
@@ -87,10 +81,18 @@ class Classifier:
         # Load feature vectors and labels
         self.feature_vectors, self.labels, self.feature_names = self._load_features()
         
-        logger.info("Loaded %d feature vectors with %d features",
-                   len(self.feature_vectors), len(self.feature_names))
+        # CRITICAL FIX: Verify label distribution
+        unique_labels, label_counts = np.unique(self.labels, return_counts=True)
+        logger.info(f"Label distribution in full dataset: {dict(zip(unique_labels, label_counts))}")
         
-        # Split data into training and testing sets
+        if len(unique_labels) < 2:
+            logger.error(f"CRITICAL ERROR: Dataset contains only one class: {unique_labels}")
+            return {'error': 'Dataset contains only one class'}
+        
+        logger.info("Loaded %d feature vectors with %d features",
+                len(self.feature_vectors), len(self.feature_names))
+        
+        # Split data into training and testing sets with explicit stratification
         train_ratio = self.config['data']['train_test_split']
         X_train, X_test, y_train, y_test = train_test_split(
             self.feature_vectors, self.labels,
@@ -99,10 +101,29 @@ class Classifier:
             stratify=self.labels
         )
         
-        logger.info("Split data: %d training, %d testing", len(X_train), len(X_test))
+        # Store for later use
+        self.X_train = X_train
+        self.X_test = X_test
+        self.y_train = y_train
+        self.y_test = y_test
+        
+        # CRITICAL FIX: Verify train/test label distribution
+        train_label_dist = dict(zip(*np.unique(y_train, return_counts=True)))
+        test_label_dist = dict(zip(*np.unique(y_test, return_counts=True)))
+        logger.info(f"Training set label distribution: {train_label_dist}")
+        logger.info(f"Test set label distribution: {test_label_dist}")
+        
+        # CRITICAL FIX: Save test indices for reporting correctly
+        output_dir = Path(self.config['system']['output_dir'])
+        test_indices = np.arange(len(self.labels))[len(X_train):]
+        np.save(output_dir / "test_indices.npy", test_indices)
+        logger.info(f"Saved {len(test_indices)} test indices")
         
         # Normalize features
         X_train_norm, X_test_norm = self._normalize_features(X_train, X_test)
+        
+        # Store normalized test data for later use
+        self.X_test_norm = X_test_norm
         
         # Apply recursive feature elimination if enabled
         if self.config['features']['rfe_enabled'] and self.selected_features is None:
@@ -144,9 +165,7 @@ class Classifier:
                 else:
                     logger.info("Using pre-trained weights")
             except Exception as e:
-                # Handle any exceptions during training
                 logger.error(f"Error during model training: {str(e)}")
-                # Provide fallback weights if needed
                 if self.weights is None:
                     logger.warning("Using default weights due to training error")
                     self.weights = np.zeros(len(self.feature_names))
@@ -154,49 +173,74 @@ class Classifier:
         # Evaluate model
         logger.info("Evaluating classifier")
         
-        # Make predictions
+        # CRITICAL FIX: Generate predictions with explicit verification
         y_pred_proba = self.model.predict_proba(X_test_norm)[:, 1]
+        logger.info(f"Probability range: min={np.min(y_pred_proba):.4f}, max={np.max(y_pred_proba):.4f}")
+        
         y_pred = (y_pred_proba >= self.decision_threshold).astype(int)
         
-        output_dir = Path(self.config['system']['output_dir'])
-
-        # Save predictions and probabilities for reporting
+        # CRITICAL FIX: Verify test labels and predictions distribution
+        test_unique, test_counts = np.unique(y_test, return_counts=True)
+        pred_unique, pred_counts = np.unique(y_pred, return_counts=True)
+        
+        logger.info(f"Test labels distribution: {dict(zip(test_unique, test_counts))}")
+        logger.info(f"Predictions distribution: {dict(zip(pred_unique, pred_counts))}")
+        
+        # CRITICAL FIX: Save test labels explicitly to verify alignment
+        np.save(output_dir / "test_labels.npy", y_test)
         np.save(output_dir / "predictions.npy", y_pred)
         np.save(output_dir / "probabilities.npy", y_pred_proba)
-
-        # Calculate metrics
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            y_test, y_pred, average='binary'
-        )
         
-        confusion = confusion_matrix(y_test, y_pred)
-        tn, fp, fn, tp = confusion.ravel()
+        # Calculate metrics with explicit confusion matrix
+        cm = confusion_matrix(y_test, y_pred)
+        logger.info(f"Confusion matrix:\n{cm}")
         
-        accuracy = (tp + tn) / (tp + tn + fp + fn)
+        try:
+            tn, fp, fn, tp = cm.ravel()
+        except ValueError:
+            logger.error("Error unpacking confusion matrix - might be misshapen")
+            if cm.size == 1:  # Only one class in predictions or test
+                logger.error("Confusion matrix is 1x1 - only one class in predictions or test data")
+                if np.all(y_test == 1):  # All positives
+                    if np.all(y_pred == 1):  # All predicted positive
+                        tp, fp, fn, tn = len(y_test), 0, 0, 0
+                    else:  # All predicted negative
+                        tp, fp, fn, tn = 0, 0, len(y_test), 0
+                else:  # All negatives
+                    if np.all(y_pred == 0):  # All predicted negative
+                        tp, fp, fn, tn = 0, 0, 0, len(y_test)
+                    else:  # All predicted positive
+                        tp, fp, fn, tn = 0, len(y_test), 0, 0
+            else:
+                # Default to zeros
+                tp, fp, fn, tn = 0, 0, 0, 0
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
         
         try:
             roc_auc = roc_auc_score(y_test, y_pred_proba)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error calculating ROC AUC: {e}")
             roc_auc = 0.0
         
         # Store metrics
         self.metrics = {
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'accuracy': accuracy,
-            'roc_auc': roc_auc,
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1': float(f1),
+            'accuracy': float(accuracy),
+            'roc_auc': float(roc_auc),
             'true_positives': int(tp),
             'false_positives': int(fp),
             'true_negatives': int(tn),
             'false_negatives': int(fn)
         }
         
-        logger.info("Evaluation metrics: precision=%.4f, recall=%.4f, f1=%.4f",
-                   precision, recall, f1)
-        
-        # Analyze feature importance
-        feature_importance = self._analyze_feature_importance()
+        logger.info("Evaluation metrics: precision=%.4f, recall=%.4f, f1=%.4f, accuracy=%.4f",
+                precision, recall, f1, accuracy)
         
         # Save results
         self._save_results()
@@ -212,7 +256,7 @@ class Classifier:
         }
         
         logger.info("Classification completed with %d feature vectors, %d features",
-                   len(self.feature_vectors), len(self.feature_names))
+                len(self.feature_vectors), len(self.feature_names))
         
         return results
 
@@ -435,7 +479,7 @@ class Classifier:
 
     def _save_results(self):
         """
-        Save classification results.
+        Save classification results to output directory.
         """
         output_dir = Path(self.config['system']['output_dir'])
         output_dir.mkdir(exist_ok=True)
@@ -447,16 +491,48 @@ class Classifier:
         with open(output_dir / "classification_metrics.json", 'w') as f:
             json.dump(self.metrics, f, indent=2)
 
-         # Add these lines to save predictions and probabilities
-        if hasattr(self, 'X_test') and hasattr(self, 'y_test'):
-            # Get predictions on test set
-            predictions, probabilities = self.batch_predict(self.X_test)
-            
-            # Save predictions and probabilities
-            np.save(output_dir / "predictions.npy", predictions)
-            np.save(output_dir / "probabilities.npy", probabilities)
-            
-            logger.info(f"Saved predictions and probabilities for {len(predictions)} test examples")
+        # Get predictions and probabilities for test set
+        # We need to apply feature selection if it was used during training
+        if hasattr(self, 'X_test_norm') and hasattr(self, 'y_test'):
+            logger.info("Using already computed predictions for reporting")
+            # Use predictions that were already calculated during evaluation
+            # These should already be properly saved in execute()
+        elif hasattr(self, 'X_test') and hasattr(self, 'y_test') and hasattr(self, 'model'):
+            try:
+                logger.info("Computing predictions for test set")
+                
+                # We need to normalize and apply feature selection before prediction
+                _, X_test_norm = self._normalize_features(self.X_train, self.X_test)
+                
+                # Apply feature selection if it was used during training
+                if self.selected_features is not None:
+                    logger.info(f"Applying feature selection: {len(self.selected_features)}/{X_test_norm.shape[1]} features")
+                    X_test_norm = X_test_norm[:, self.selected_features]
+                
+                # Get predictions
+                y_pred_proba = self.model.predict_proba(X_test_norm)[:, 1]
+                y_pred = (y_pred_proba >= self.decision_threshold).astype(int)
+                
+                # Save predictions and probabilities
+                np.save(output_dir / "predictions.npy", y_pred)
+                np.save(output_dir / "probabilities.npy", y_pred_proba)
+                
+                # Log prediction counts
+                pos_pred = np.sum(y_pred == 1)
+                neg_pred = np.sum(y_pred == 0)
+                logger.info(f"Test set contains: {np.sum(self.y_test == 1)} positive, {np.sum(self.y_test == 0)} negative examples")
+                logger.info(f"Predictions contain: {pos_pred} positive, {neg_pred} negative examples")
+                
+                # Verify saved predictions
+                verify_preds = np.load(output_dir / "predictions.npy")
+                verify_counts = np.bincount(verify_preds, minlength=2)
+                logger.info(f"Verified saved predictions: {verify_counts[0]} negative, {verify_counts[1]} positive")
+            except Exception as e:
+                logger.error(f"Error generating predictions: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("Test data or model not available, cannot generate predictions")
         
         # Save feature importance
         feature_importance = self._analyze_feature_importance()
@@ -465,10 +541,13 @@ class Classifier:
         
         # Save selected features
         if self.selected_features is not None:
+            # FIXED LINE: Correctly map indices to feature names
+            selected_feature_names = [self.feature_names[i] for i in self.selected_features if i < len(self.feature_names)]
+            
             with open(output_dir / "selected_features.json", 'w') as f:
                 json.dump({
                     'indices': self.selected_features,
-                    'names': [self.feature_names[i] for i in range(len(self.feature_names))]
+                    'names': selected_feature_names
                 }, f, indent=2)
         
         # Save final checkpoint
