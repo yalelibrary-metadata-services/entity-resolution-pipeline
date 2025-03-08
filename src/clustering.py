@@ -1,40 +1,36 @@
 """
-Improved clustering module for entity resolution.
+Redesigned clustering module for entity resolution.
 
-This module provides the Clusterer class, which handles grouping of matched
-entity pairs into clusters representing the same real-world entity with 
-enhanced robustness and error handling.
+This module provides the Clusterer class for grouping matched entity pairs
+into clusters with improved data management and consistency.
 """
 
 import os
 import logging
-import json
-import time
 import numpy as np
+import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
+from typing import Dict, List, Tuple, Union, Optional
 import networkx as nx
-from collections import defaultdict
-import pickle
+from tqdm import tqdm
 import matplotlib.pyplot as plt
-import seaborn as sns
+import time
 
-from src.utils import save_checkpoint, load_checkpoint, Timer
+from src.utils import Timer
+from src.data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
 class Clusterer:
     """
-    Handles clustering of matched entity pairs into entity clusters with improved
-    robustness and error handling.
+    Handles clustering of entity pairs into groups that represent the same
+    real-world entities with improved data management.
     
     Features:
-    - Graph-based community detection
-    - Transitivity enforcement
-    - Enhanced conflict resolution
-    - Better serialization and checkpointing
-    - Robust error recovery
-    - Detailed diagnostics
+    - Standardized data management using DataManager
+    - Graph-based clustering algorithms with robust error handling
+    - Comprehensive metrics and visualization
+    - Proper validation and consistency checking
     """
     
     def __init__(self, config):
@@ -45,6 +41,9 @@ class Clusterer:
             config (dict): Configuration parameters
         """
         self.config = config
+        
+        # Initialize data manager
+        self.data_manager = DataManager(config)
         
         # Clustering parameters
         self.algorithm = config['clustering']['algorithm']
@@ -61,24 +60,17 @@ class Clusterer:
         # Initialize data structures
         self.graph = nx.Graph()
         self.clusters = []
+        self.entity_to_cluster = {}
+        
+        # Results
         self.metrics = {}
-        self.entity_to_cluster = {}  # Mapping from entities to cluster IDs
-        
-        # Set up paths
-        self.output_dir = Path(self.config['system']['output_dir'])
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.checkpoint_dir = Path(self.config['system']['checkpoint_dir'])
-        self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
-        
-        self.viz_dir = self.output_dir / "visualizations" / "clustering"
-        self.viz_dir.mkdir(parents=True, exist_ok=True)
+        self.visualization_paths = {}
         
         logger.info("Clusterer initialized with algorithm: %s", self.algorithm)
-
+    
     def execute(self, checkpoint=None):
         """
-        Execute clustering of matched entity pairs with enhanced robustness.
+        Execute clustering process.
         
         Args:
             checkpoint (str, optional): Path to checkpoint file. Defaults to None.
@@ -86,20 +78,24 @@ class Clusterer:
         Returns:
             dict: Clustering results
         """
-        # Load checkpoint if provided
-        if checkpoint and os.path.exists(checkpoint):
-            state = self._load_checkpoint(checkpoint)
-            if state:
-                logger.info("Resumed clustering from checkpoint: %s", checkpoint)
+        logger.info("Starting clustering process")
         
-        # Build graph from classified pairs if not already built
-        if self.graph.number_of_nodes() == 0:
-            self._build_graph()
+        # Check if clustering results already exist
+        if self.data_manager.exists('clustering_index'):
+            logger.info("Loading existing clustering results")
+            return self._load_clustering_results()
         
-        logger.info("Graph has %d nodes and %d edges", 
-                   self.graph.number_of_nodes(), self.graph.number_of_edges())
+        # Build graph from classified pairs
+        if not self._build_graph():
+            logger.error("Failed to build graph")
+            return {
+                'error': 'Failed to build graph',
+                'status': 'failed'
+            }
         
-        # Save initial graph state for diagnostics
+        logger.info(f"Graph has {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
+        
+        # Save initial graph stats
         self._save_graph_stats("initial_graph")
         
         # Apply transitivity if enabled
@@ -109,13 +105,13 @@ class Clusterer:
                 added_edges = self._apply_transitivity()
                 logger.info(f"Added {added_edges} transitive edges in {timer.duration:.2f} seconds")
             
-            # Save post-transitivity graph state
+            # Save post-transitivity graph stats
             self._save_graph_stats("post_transitivity_graph")
         
-        # Perform clustering
+        # Perform clustering with error handling
         try:
             with Timer() as timer:
-                logger.info("Performing clustering with algorithm: %s", self.algorithm)
+                logger.info(f"Performing clustering with algorithm: {self.algorithm}")
                 
                 if self.algorithm == 'connected_components':
                     self.clusters = self._cluster_connected_components()
@@ -132,8 +128,8 @@ class Clusterer:
                 else:
                     raise ValueError(f"Unsupported clustering algorithm: {self.algorithm}")
                 
-                logger.info("Clustering completed in %.2f seconds with %d clusters", 
-                           timer.duration, len(self.clusters))
+                logger.info(f"Clustering completed in {timer.duration:.2f} seconds with {len(self.clusters)} clusters")
+        
         except Exception as e:
             logger.error(f"Error during clustering: {str(e)}")
             import traceback
@@ -145,10 +141,12 @@ class Clusterer:
             
             if not self.clusters:
                 logger.error("Failed to create clusters with fallback method")
-                # Create empty cluster result
-                self.clusters = []
+                return {
+                    'error': 'Failed to create clusters',
+                    'status': 'failed'
+                }
         
-        # Filter clusters by size
+        # Filter clusters based on size
         logger.info("Filtering clusters based on size criteria")
         self._filter_clusters()
         
@@ -165,10 +163,52 @@ class Clusterer:
         # Calculate metrics
         self._calculate_metrics()
         
-        # Save results
-        self._save_results()
+        # Generate visualizations
+        self._generate_visualizations()
         
+        # Save clustering results
+        self.data_manager.save_cluster_data(
+            self.clusters,
+            self.metrics,
+            self.entity_to_cluster
+        )
+        
+        # Return results
         results = {
+            'clusters': len(self.clusters),
+            'total_entities': sum(len(c) for c in self.clusters),
+            'singleton_clusters': sum(1 for c in self.clusters if len(c) == 1),
+            'max_cluster_size': max((len(c) for c in self.clusters), default=0),
+            'min_cluster_size': min((len(c) for c in self.clusters), default=0) if self.clusters else 0,
+            'metrics': self.metrics,
+            'visualization_paths': self.visualization_paths
+        }
+        
+        logger.info(f"Clustering completed: {len(self.clusters)} clusters, {sum(len(c) for c in self.clusters)} total entities")
+        
+        return results
+    
+    def _load_clustering_results(self):
+        """
+        Load existing clustering results.
+        
+        Returns:
+            dict: Clustering results
+        """
+        # Load results from data manager
+        results = self.data_manager.load_cluster_data()
+        
+        if not results:
+            logger.warning("Could not load clustering results")
+            return {'error': 'Could not load clustering results', 'status': 'failed'}
+        
+        # Set instance variables
+        self.clusters = results.get('clusters', [])
+        self.metrics = results.get('metrics', {})
+        self.entity_to_cluster = results.get('entity_to_cluster', {})
+        
+        # Return results in the expected format
+        return {
             'clusters': len(self.clusters),
             'total_entities': sum(len(c) for c in self.clusters),
             'singleton_clusters': sum(1 for c in self.clusters if len(c) == 1),
@@ -176,15 +216,13 @@ class Clusterer:
             'min_cluster_size': min((len(c) for c in self.clusters), default=0) if self.clusters else 0,
             'metrics': self.metrics
         }
-        
-        logger.info("Clustering completed: %d clusters, %d total entities",
-                   len(self.clusters), sum(len(c) for c in self.clusters))
-        
-        return results
-
+    
     def _build_graph(self):
         """
-        Build entity graph from classified pairs with enhanced robustness.
+        Build graph from classified pairs with improved robustness.
+        
+        Returns:
+            bool: True if graph was built successfully, False otherwise
         """
         logger.info("Building entity graph from classified pairs")
         
@@ -194,12 +232,14 @@ class Clusterer:
         edges_added = 0
         
         try:
-            # First try to load classified pairs
-            classified_pairs = self._load_classified_pairs()
+            # Load classified pairs from data manager
+            classified_pairs = self.data_manager.load('classified_pairs')
+            
             if classified_pairs:
                 logger.info(f"Loaded {len(classified_pairs)} classified pairs")
                 total_pairs = len(classified_pairs)
                 
+                # Process classified pairs
                 for pair in tqdm(classified_pairs, desc="Adding edges from classified pairs"):
                     try:
                         record1_id = pair.get('record1_id')
@@ -218,12 +258,14 @@ class Clusterer:
                         logger.error(f"Error processing classified pair: {e}")
                         continue
             else:
-                # Fall back to pre-filtered pairs if available
-                prefiltered_true = self._load_prefiltered_pairs()
+                # Try loading prefiltered true pairs as fallback
+                prefiltered_true = self.data_manager.load('prefiltered_true')
+                
                 if prefiltered_true:
                     logger.info(f"Using {len(prefiltered_true)} prefiltered pairs")
                     total_pairs = len(prefiltered_true)
                     
+                    # Process prefiltered pairs
                     for pair in tqdm(prefiltered_true, desc="Adding edges from prefiltered pairs"):
                         try:
                             record1_id = pair.get('record1_id')
@@ -239,7 +281,25 @@ class Clusterer:
                             logger.error(f"Error processing prefiltered pair: {e}")
                             continue
                 else:
-                    logger.warning("No classification data found, graph will be empty")
+                    # Try loading ground truth pairs if both previous attempts failed
+                    ground_truth = self.data_manager.load('ground_truth')
+                    
+                    if ground_truth:
+                        logger.info(f"Using {len(ground_truth)} ground truth pairs as fallback")
+                        
+                        for pair_id, is_match in ground_truth.items():
+                            if is_match:  # Only use positive matches
+                                try:
+                                    record_ids = pair_id.split('|')
+                                    if len(record_ids) == 2:
+                                        record1_id, record2_id = record_ids
+                                        self.graph.add_edge(record1_id, record2_id, weight=1.0)
+                                        edges_added += 1
+                                except Exception as e:
+                                    logger.error(f"Error processing ground truth pair: {e}")
+                                    continue
+                    else:
+                        logger.warning("No classification data found, graph will be empty")
         
         except Exception as e:
             logger.error(f"Error building graph: {e}")
@@ -249,90 +309,11 @@ class Clusterer:
         logger.info(f"Built graph with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
         logger.info(f"Added {edges_added} edges from {total_pairs} pairs ({edges_added/max(1, total_pairs):.2%} conversion rate)")
         
-        # Save the initial graph structure for diagnostics
-        self._save_graph_visualization("initial_graph")
+        # Save the graph for later use
+        self.data_manager.save('entity_graph', self._get_adjacency_list(), stage='cluster')
         
         return self.graph.number_of_edges() > 0
-
-    def _load_classified_pairs(self):
-        """
-        Load classified pairs with support for multiple formats and sources.
-        
-        Returns:
-            list: Classified pairs or empty list if not found
-        """
-        try:
-            # Try multiple possible file names and formats
-            possible_files = [
-                "classified_pairs.json",
-                "classifier_output.json",
-                "match_pairs.json"
-            ]
-            
-            for file_name in possible_files:
-                file_path = self.output_dir / file_name
-                if file_path.exists():
-                    with open(file_path, 'r') as f:
-                        pairs = json.load(f)
-                        logger.info(f"Loaded {len(pairs)} pairs from {file_path}")
-                        return pairs
-            
-            # If no JSON file found, try pickle files
-            pickle_path = self.output_dir / "classified_pairs.pkl"
-            if pickle_path.exists():
-                with open(pickle_path, 'rb') as f:
-                    pairs = pickle.load(f)
-                    logger.info(f"Loaded {len(pairs)} pairs from {pickle_path}")
-                    return pairs
-            
-            logger.warning("No classified pairs file found")
-            return []
-        
-        except Exception as e:
-            logger.error(f"Error loading classified pairs: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return []
-
-    def _load_prefiltered_pairs(self):
-        """
-        Load prefiltered true pairs for fallback.
-        
-        Returns:
-            list: Prefiltered pairs or empty list if not found
-        """
-        try:
-            # Try multiple possible file names
-            possible_files = [
-                "prefiltered_true.json",
-                "prefiltered_matches.json"
-            ]
-            
-            for file_name in possible_files:
-                file_path = self.output_dir / file_name
-                if file_path.exists():
-                    with open(file_path, 'r') as f:
-                        pairs = json.load(f)
-                        logger.info(f"Loaded {len(pairs)} prefiltered pairs from {file_path}")
-                        return pairs
-            
-            # If no JSON file found, try pickle files
-            pickle_path = self.output_dir / "prefiltered_true.pkl"
-            if pickle_path.exists():
-                with open(pickle_path, 'rb') as f:
-                    pairs = pickle.load(f)
-                    logger.info(f"Loaded {len(pairs)} prefiltered pairs from {pickle_path}")
-                    return pairs
-            
-            logger.warning("No prefiltered pairs file found")
-            return []
-        
-        except Exception as e:
-            logger.error(f"Error loading prefiltered pairs: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return []
-
+    
     def _apply_transitivity(self):
         """
         Apply transitivity to the entity graph with enhanced efficiency.
@@ -370,7 +351,7 @@ class Clusterer:
         
         logger.info(f"Added {added_edges} transitive edges")
         return added_edges
-
+    
     def _cluster_connected_components(self):
         """
         Cluster entities using connected components.
@@ -386,7 +367,7 @@ class Clusterer:
         clusters = [list(component) for component in components]
         
         return clusters
-
+    
     def _cluster_louvain(self):
         """
         Cluster entities using Louvain community detection.
@@ -411,6 +392,7 @@ class Clusterer:
             partition = community_louvain.best_partition(self.graph)
             
             # Group nodes by community
+            from collections import defaultdict
             communities = defaultdict(list)
             for node, community_id in partition.items():
                 communities[community_id].append(node)
@@ -430,7 +412,7 @@ class Clusterer:
             # Fall back to connected components
             logger.warning("Falling back to connected components")
             return self._cluster_connected_components()
-
+    
     def _cluster_label_propagation(self):
         """
         Cluster entities using label propagation.
@@ -457,7 +439,7 @@ class Clusterer:
             # Fall back to connected components
             logger.warning("Falling back to connected components")
             return self._cluster_connected_components()
-
+    
     def _cluster_hierarchical(self):
         """
         Cluster entities using hierarchical clustering.
@@ -492,6 +474,7 @@ class Clusterer:
                         sub_partition = community_louvain.best_partition(subgraph)
                         
                         # Group nodes by community
+                        from collections import defaultdict
                         sub_communities = defaultdict(list)
                         for node, community_id in sub_partition.items():
                             sub_communities[community_id].append(node)
@@ -530,6 +513,7 @@ class Clusterer:
                 cluster_labels = fcluster(Z, threshold, criterion='distance')
                 
                 # Group nodes by cluster label
+                from collections import defaultdict
                 component_clusters = defaultdict(list)
                 for i, label in enumerate(cluster_labels):
                     component_clusters[label].append(nodes[i])
@@ -549,7 +533,7 @@ class Clusterer:
             # Fall back to connected components
             logger.warning("Falling back to connected components")
             return self._cluster_connected_components()
-
+    
     def _filter_clusters(self):
         """
         Filter clusters based on size and quality criteria.
@@ -599,10 +583,10 @@ class Clusterer:
         
         filtered_count = len(self.clusters)
         logger.info(f"Filtered clusters: {original_count} -> {filtered_count}")
-
+    
     def _resolve_conflicts(self):
         """
-        Resolve conflicts between clusters with improved algorithm.
+        Resolve conflicts between clusters.
         
         If the same entity appears in multiple clusters, assign it to the
         cluster with the strongest connections.
@@ -611,6 +595,7 @@ class Clusterer:
             int: Number of conflicts resolved
         """
         # Count entities in each cluster
+        from collections import defaultdict
         entity_to_clusters = defaultdict(list)
         
         for i, cluster in enumerate(self.clusters):
@@ -674,7 +659,7 @@ class Clusterer:
         self.clusters = [list(cluster) for cluster in resolved_clusters if cluster]
         
         return resolved_count
-
+    
     def _build_entity_to_cluster_mapping(self):
         """
         Build mapping from entities to cluster IDs for efficient lookup.
@@ -686,10 +671,10 @@ class Clusterer:
                 self.entity_to_cluster[entity] = cluster_id
         
         logger.info(f"Built entity-to-cluster mapping for {len(self.entity_to_cluster)} entities")
-
+    
     def _calculate_metrics(self):
         """
-        Calculate clustering metrics with more comprehensive statistics.
+        Calculate clustering metrics.
         """
         # Count clusters by size
         size_counts = {}
@@ -765,101 +750,7 @@ class Clusterer:
                     '1': 0, '2-5': 0, '6-10': 0, '11-20': 0, '21-50': 0, '51+': 0
                 }
             }
-
-    def _load_checkpoint(self, checkpoint_path):
-        """
-        Load checkpoint with better error handling.
-        
-        Args:
-            checkpoint_path (str): Path to checkpoint file
-            
-        Returns:
-            bool: True if checkpoint was loaded successfully, False otherwise
-        """
-        try:
-            state = load_checkpoint(checkpoint_path)
-            
-            # Check if checkpoint contains valid data
-            if not state:
-                logger.error("Empty or invalid checkpoint")
-                return False
-            
-            # Try to load graph from adjacency list
-            if 'adjacency_list' in state:
-                adjacency_list = state['adjacency_list']
-                self.graph = nx.Graph()
-                
-                for node, neighbors in adjacency_list.items():
-                    for neighbor, weight in neighbors.items():
-                        self.graph.add_edge(node, neighbor, weight=weight)
-                
-                logger.info(f"Loaded graph with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
-            
-            # Load clusters
-            if 'clusters' in state:
-                self.clusters = state['clusters']
-                logger.info(f"Loaded {len(self.clusters)} clusters")
-            
-            # Load metrics
-            if 'metrics' in state:
-                self.metrics = state['metrics']
-            
-            # Rebuild entity to cluster mapping
-            self._build_entity_to_cluster_mapping()
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"Error loading checkpoint: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
-    def _save_results(self):
-        """
-        Save clustering results with improved organization and format.
-        """
-        try:
-            output_dir = self.output_dir
-            
-            # Save clusters
-            with open(output_dir / "entity_clusters.json", 'w') as f:
-                json.dump(self.clusters, f, indent=2)
-            
-            # Save a sample of the largest clusters
-            largest_clusters = sorted(self.clusters, key=len, reverse=True)[:20]
-            with open(output_dir / "largest_clusters_sample.json", 'w') as f:
-                json.dump(largest_clusters, f, indent=2)
-            
-            # Save metrics
-            with open(output_dir / "clustering_metrics.json", 'w') as f:
-                json.dump(self.metrics, f, indent=2)
-            
-            # Save entity to cluster mapping
-            with open(output_dir / "entity_to_cluster.json", 'w') as f:
-                json.dump(self.entity_to_cluster, f, indent=2)
-            
-            # Save graph as adjacency list (more compact than full graph)
-            adjacency_list = self._get_adjacency_list()
-            
-            # Save final checkpoint
-            checkpoint_path = self.checkpoint_dir / "clustering_final.ckpt"
-            save_checkpoint({
-                'adjacency_list': adjacency_list,
-                'clusters': self.clusters,
-                'metrics': self.metrics
-            }, checkpoint_path)
-            
-            # Generate visualizations
-            self._generate_visualizations()
-            
-            logger.info(f"Clustering results saved to {output_dir}")
-        
-        except Exception as e:
-            logger.error(f"Error saving clustering results: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-
+    
     def _get_adjacency_list(self):
         """
         Get adjacency list representation of the graph.
@@ -875,13 +766,13 @@ class Clusterer:
                 adjacency_list[node][neighbor] = self.graph[node][neighbor].get('weight', 1.0)
         
         return adjacency_list
-
+    
     def _save_graph_stats(self, prefix):
         """
         Save graph statistics for diagnostics.
         
         Args:
-            prefix (str): Prefix for output filenames
+            prefix (str): Prefix for stats identifier
         """
         try:
             # Calculate graph statistics
@@ -910,91 +801,72 @@ class Clusterer:
             graph_stats['weight_distribution'] = weight_dist
             
             # Save statistics
-            with open(self.output_dir / f"{prefix}_stats.json", 'w') as f:
-                json.dump(graph_stats, f, indent=2)
+            self.data_manager.save(f"{prefix}_stats", graph_stats, stage='cluster')
             
             logger.info(f"Saved graph statistics for {prefix}")
         
         except Exception as e:
             logger.error(f"Error saving graph statistics: {e}")
-
-    def _save_graph_visualization(self, prefix):
-        """
-        Save a visualization of the graph structure.
-        
-        Args:
-            prefix (str): Prefix for output filename
-        """
-        try:
-            # Check if graph is too large to visualize
-            if self.graph.number_of_nodes() > 1000:
-                logger.warning(f"Graph too large to visualize: {self.graph.number_of_nodes()} nodes")
-                return
-            
-            # Create visualization
-            plt.figure(figsize=(12, 12))
-            
-            # Use spring layout with seed for reproducibility
-            pos = nx.spring_layout(self.graph, seed=42)
-            
-            # Get edge weights for width and color
-            edge_weights = [self.graph[u][v].get('weight', 1.0) for u, v in self.graph.edges()]
-            
-            # Draw the graph
-            nx.draw_networkx(
-                self.graph,
-                pos=pos,
-                with_labels=False,
-                node_size=20,
-                node_color='skyblue',
-                edge_color=edge_weights,
-                width=[w * 2 for w in edge_weights],
-                edge_cmap=plt.cm.Blues,
-                alpha=0.7
-            )
-            
-            plt.title(f"Entity Graph ({self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges)")
-            plt.axis('off')
-            
-            # Save visualization
-            plt.savefig(self.viz_dir / f"{prefix}.png", dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            logger.info(f"Saved graph visualization to {self.viz_dir / f'{prefix}.png'}")
-        
-        except Exception as e:
-            logger.error(f"Error saving graph visualization: {e}")
-
+    
     def _generate_visualizations(self):
         """
         Generate visualizations for clustering results.
         """
         try:
+            # Create visualizations directory
+            output_dir = Path(self.config['system']['output_dir'])
+            viz_dir = output_dir / "visualizations" / "clustering"
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            
             # 1. Cluster size distribution
-            self._plot_cluster_size_distribution()
+            size_path = viz_dir / "cluster_size_distribution.png"
+            self._plot_cluster_size_distribution(size_path)
+            self.visualization_paths['cluster_size_distribution'] = str(size_path)
             
             # 2. Degree distribution
-            self._plot_degree_distribution()
+            degree_path = viz_dir / "degree_distribution.png"
+            self._plot_degree_distribution(degree_path)
+            self.visualization_paths['degree_distribution'] = str(degree_path)
             
             # 3. Edge weight distribution
-            self._plot_edge_weight_distribution()
+            weight_path = viz_dir / "edge_weight_distribution.png"
+            self._plot_edge_weight_distribution(weight_path)
+            self.visualization_paths['edge_weight_distribution'] = str(weight_path)
             
             # 4. Cluster size groups
-            self._plot_cluster_size_groups()
+            groups_path = viz_dir / "cluster_size_groups.png"
+            self._plot_cluster_size_groups(groups_path)
+            self.visualization_paths['cluster_size_groups'] = str(groups_path)
             
-            # 5. Sample large clusters visualization
-            self._plot_sample_clusters()
+            # 5. Sample large clusters visualization (if graph is not too large)
+            if self.graph.number_of_nodes() <= 10000:
+                largest_clusters = sorted(self.clusters, key=len, reverse=True)[:5]
+                
+                for i, cluster in enumerate(largest_clusters):
+                    # Skip very large clusters for visualization
+                    if len(cluster) > 100:
+                        continue
+                    
+                    cluster_path = viz_dir / f"cluster_{i+1}.png"
+                    self._plot_cluster(cluster, i+1, cluster_path)
+                    self.visualization_paths[f'cluster_{i+1}'] = str(cluster_path)
             
-            logger.info(f"Generated clustering visualizations in {self.viz_dir}")
+            # Save visualization paths
+            self.data_manager.save('clustering_visualizations', self.visualization_paths, stage='cluster')
+            
+            logger.info(f"Generated {len(self.visualization_paths)} visualizations")
         
         except Exception as e:
             logger.error(f"Error generating visualizations: {e}")
             import traceback
             logger.error(traceback.format_exc())
-
-    def _plot_cluster_size_distribution(self):
+    
+    def _plot_cluster_size_distribution(self, output_path):
         """
         Generate cluster size distribution plot.
+        
+        Args:
+            output_path (Path): Output file path
         """
         try:
             # Get cluster sizes
@@ -1014,17 +886,20 @@ class Clusterer:
             plt.tight_layout()
             
             # Save plot
-            plt.savefig(self.viz_dir / "cluster_size_distribution.png")
+            plt.savefig(output_path)
             plt.close()
             
             logger.info("Generated cluster size distribution plot")
         
         except Exception as e:
             logger.error(f"Error generating cluster size distribution plot: {e}")
-
-    def _plot_degree_distribution(self):
+    
+    def _plot_degree_distribution(self, output_path):
         """
         Generate node degree distribution plot.
+        
+        Args:
+            output_path (Path): Output file path
         """
         try:
             # Get degrees
@@ -1044,17 +919,20 @@ class Clusterer:
             plt.tight_layout()
             
             # Save plot
-            plt.savefig(self.viz_dir / "degree_distribution.png")
+            plt.savefig(output_path)
             plt.close()
             
             logger.info("Generated node degree distribution plot")
         
         except Exception as e:
             logger.error(f"Error generating degree distribution plot: {e}")
-
-    def _plot_edge_weight_distribution(self):
+    
+    def _plot_edge_weight_distribution(self, output_path):
         """
         Generate edge weight distribution plot.
+        
+        Args:
+            output_path (Path): Output file path
         """
         try:
             # Get edge weights
@@ -1074,17 +952,20 @@ class Clusterer:
             plt.tight_layout()
             
             # Save plot
-            plt.savefig(self.viz_dir / "edge_weight_distribution.png")
+            plt.savefig(output_path)
             plt.close()
             
             logger.info("Generated edge weight distribution plot")
         
         except Exception as e:
             logger.error(f"Error generating edge weight distribution plot: {e}")
-
-    def _plot_cluster_size_groups(self):
+    
+    def _plot_cluster_size_groups(self, output_path):
         """
         Generate cluster size groups plot.
+        
+        Args:
+            output_path (Path): Output file path
         """
         try:
             # Get size groups from metrics
@@ -1110,74 +991,61 @@ class Clusterer:
             plt.tight_layout()
             
             # Save plot
-            plt.savefig(self.viz_dir / "cluster_size_groups.png")
+            plt.savefig(output_path)
             plt.close()
             
             logger.info("Generated cluster size groups plot")
         
         except Exception as e:
             logger.error(f"Error generating cluster size groups plot: {e}")
-
-    def _plot_sample_clusters(self):
+    
+    def _plot_cluster(self, cluster, cluster_id, output_path):
         """
-        Generate visualization of sample large clusters.
+        Generate visualization of a cluster.
+        
+        Args:
+            cluster (list): Cluster to visualize
+            cluster_id (int): Cluster identifier
+            output_path (Path): Output file path
         """
         try:
-            # Get largest clusters
-            largest_clusters = sorted(self.clusters, key=len, reverse=True)[:5]
+            # Get subgraph for this cluster
+            subgraph = self.graph.subgraph(cluster).copy()
             
-            if not largest_clusters:
-                logger.warning("No clusters to visualize")
-                return
+            # Create plot
+            plt.figure(figsize=(10, 8))
             
-            # Plot each large cluster
-            for i, cluster in enumerate(largest_clusters):
-                try:
-                    if len(cluster) > 100:
-                        # Skip very large clusters
-                        logger.info(f"Skipping visualization of cluster {i} (size {len(cluster)})")
-                        continue
-                    
-                    # Get subgraph for this cluster
-                    subgraph = self.graph.subgraph(cluster).copy()
-                    
-                    # Create plot
-                    plt.figure(figsize=(10, 8))
-                    
-                    # Use spring layout with seed for reproducibility
-                    pos = nx.spring_layout(subgraph, seed=42)
-                    
-                    # Get edge weights for width
-                    edge_weights = [subgraph[u][v].get('weight', 1.0) for u, v in subgraph.edges()]
-                    
-                    # Draw the subgraph
-                    nx.draw_networkx(
-                        subgraph,
-                        pos=pos,
-                        with_labels=False,
-                        node_size=30,
-                        node_color='skyblue',
-                        edge_color=edge_weights,
-                        width=[w * 2 for w in edge_weights],
-                        edge_cmap=plt.cm.Blues,
-                        alpha=0.7
-                    )
-                    
-                    plt.title(f"Cluster {i+1} (size {len(cluster)})")
-                    plt.axis('off')
-                    
-                    # Save visualization
-                    plt.savefig(self.viz_dir / f"cluster_{i+1}.png", dpi=300, bbox_inches='tight')
-                    plt.close()
-                except Exception as e:
-                    logger.error(f"Error visualizing cluster {i}: {e}")
-                    continue
+            # Use spring layout with seed for reproducibility
+            pos = nx.spring_layout(subgraph, seed=42)
             
-            logger.info("Generated sample cluster visualizations")
+            # Get edge weights for width
+            edge_weights = [subgraph[u][v].get('weight', 1.0) for u, v in subgraph.edges()]
+            
+            # Draw the subgraph
+            nx.draw_networkx(
+                subgraph,
+                pos=pos,
+                with_labels=False,
+                node_size=30,
+                node_color='skyblue',
+                edge_color=edge_weights,
+                width=[w * 2 for w in edge_weights],
+                edge_cmap=plt.cm.Blues,
+                alpha=0.7
+            )
+            
+            plt.title(f"Cluster {cluster_id} (size {len(cluster)})")
+            plt.axis('off')
+            
+            # Save visualization
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Generated visualization for cluster {cluster_id}")
         
         except Exception as e:
-            logger.error(f"Error generating sample cluster visualizations: {e}")
-
+            logger.error(f"Error visualizing cluster {cluster_id}: {e}")
+    
     def get_cluster_for_entity(self, entity_id):
         """
         Get the cluster containing a specific entity.
@@ -1198,7 +1066,7 @@ class Clusterer:
                 return cluster
         
         return None
-
+    
     def get_entity_cluster_id(self, entity_id):
         """
         Get the cluster ID for a specific entity.
@@ -1210,7 +1078,7 @@ class Clusterer:
             int: Cluster ID, or -1 if not found
         """
         return self.entity_to_cluster.get(entity_id, -1)
-
+    
     def get_largest_clusters(self, n=10):
         """
         Get the n largest clusters.
@@ -1230,7 +1098,7 @@ class Clusterer:
         largest.sort(key=lambda x: len(x[1]), reverse=True)
         
         return largest[:n]
-
+    
     def export_clusters_csv(self, output_path=None):
         """
         Export clusters to CSV format.
@@ -1242,18 +1110,29 @@ class Clusterer:
             str: Path to CSV file
         """
         if output_path is None:
-            output_path = self.output_dir / "entity_clusters.csv"
+            output_dir = Path(self.config['system']['output_dir'])
+            output_path = output_dir / "entity_clusters.csv"
         
         try:
-            with open(output_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['cluster_id', 'entity_id'])
-                
-                for cluster_id, cluster in enumerate(self.clusters):
-                    for entity_id in cluster:
-                        writer.writerow([cluster_id, entity_id])
+            # Create DataFrame for better CSV handling
+            rows = []
+            for cluster_id, cluster in enumerate(self.clusters):
+                for entity_id in cluster:
+                    rows.append({
+                        'cluster_id': cluster_id,
+                        'entity_id': entity_id
+                    })
+            
+            df = pd.DataFrame(rows)
+            
+            # Save to CSV
+            df.to_csv(output_path, index=False)
             
             logger.info(f"Exported clusters to CSV: {output_path}")
+            
+            # Also save using data manager for consistency
+            self.data_manager.save_dataframe('entity_clusters_csv', df)
+            
             return str(output_path)
         
         except Exception as e:

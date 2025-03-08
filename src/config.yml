@@ -1,0 +1,152 @@
+# Entity Resolution Pipeline Configuration
+
+# System configuration
+system:
+  mode: dev  # dev or prod
+  version: "1.0"
+  log_level: INFO
+  memory_limit_gb: 32
+  max_workers: 8
+  random_seed: 42
+  output_dir: output
+  checkpoint_dir: checkpoints
+  temp_dir: temp
+  dev_sample_size: 1000  # Number of samples to use in dev mode
+  continue_on_error: false
+
+# Monitoring configuration
+monitoring:
+  prometheus_enabled: false
+  prometheus_port: 8000
+  metrics_interval: 10  # seconds
+
+# Data configuration
+data:
+  input_dir: input
+  ground_truth_file: ground_truth.csv
+  train_test_split: 0.7  # Training set ratio
+  checkpoints_enabled: true
+  checkpoint_interval: 50  # Save checkpoint every N batches
+  max_files: 600  # Maximum number of files to process
+
+# Embedding configuration
+embedding:
+  model: text-embedding-3-small
+  dimensions: 1536
+  batch_size: 32
+  request_timeout: 60
+  rpm_limit: 5000  # Requests per minute
+  tpm_limit: 5000000  # Tokens per minute
+  fields_to_embed:
+    - composite
+    - person
+    - title
+    - provision
+    - subjects
+
+# Weaviate configuration
+weaviate:
+  host: localhost
+  port: 8080
+  batch_size: 100
+  collection_name: UniqueStringsByField
+  ef: 128
+  max_connections: 64
+  ef_construction: 128
+  distance_metric: cosine
+
+# Imputation configuration
+imputation:
+  vector_similarity_threshold: 0.7
+  max_candidates: 10
+  imputation_method: average  # average, weighted_average, or nearest
+  fields_to_impute:
+    - provision
+    - subjects
+
+# Query configuration
+query:
+  max_candidates: 20
+  similarity_threshold: 0.7
+  max_records_per_query: 1000
+  batch_size: 100
+  max_total_candidates: 100000
+
+# Feature engineering configuration
+features:
+  cosine_similarities:
+    - person
+    - title
+    - provision
+    - subjects
+    - composite
+  
+  string_similarities:
+    - field: person
+      metrics:
+        - levenshtein
+        - jaro_winkler
+  
+  harmonic_means:
+    - [person, title]
+    - [person, provision]
+    - [person, subjects]
+    - [title, subjects]
+    - [title, provision]
+    - [provision, subjects]
+  
+  additional_interactions:
+    - type: product
+      fields: [person, subjects]
+    - type: ratio
+      fields: [composite, subjects]
+  
+  prefilters:
+    exact_name_birth_death_prefilter: true
+    composite_cosine_prefilter:
+      enabled: true
+      threshold: 0.95
+    person_cosine_prefilter:
+      enabled: true
+      threshold: 0.3
+  
+  rfe_enabled: true
+  rfe_step_size: 1
+  rfe_cv_folds: 5
+
+# Classification configuration
+classification:
+  algorithm: logistic_regression
+  regularization: l2
+  regularization_strength: 1.0
+  learning_rate: 0.01
+  max_iterations: 1000
+  convergence_tolerance: 0.0001
+  batch_size: 100
+  class_weight: balanced
+  decision_threshold: 0.55
+  classify_full_dataset: true
+
+# Clustering configuration
+clustering:
+  algorithm: connected_components  # connected_components, louvain, label_propagation, or hierarchical
+  min_edge_weight: 0.5
+  transitivity_enabled: true
+  resolve_conflicts: true
+  min_cluster_size: 1
+  max_cluster_size: 1000
+  connectivity_threshold: 0.5
+  allow_singletons: true
+
+# Reporting configuration
+reporting:
+  metrics_to_report:
+    - precision
+    - recall
+    - f1
+    - accuracy
+    - cluster_count
+    - total_entities
+  
+  generate_visualizations: true
+  csv_export_enabled: true
