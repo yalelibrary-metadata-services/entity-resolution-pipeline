@@ -140,85 +140,114 @@ class FeatureEngineer:
         return feature_names
 
     def execute(self, checkpoint=None):
-        """Execute feature engineering for entity resolution with neighborhood-based approach."""
+        """
+        Execute feature engineering using ground truth pairs directly.
+        
+        Instead of building neighborhoods, this approach:
+        1. Reads pairs directly from the ground truth file
+        2. Retrieves record information for each pair
+        3. Constructs feature vectors for those pairs
+        4. Uses these for model training
+        
+        Args:
+            checkpoint (str, optional): Path to checkpoint file. Defaults to None.
+            
+        Returns:
+            dict: Feature engineering results
+        """
         # Load ground truth data
         self.ground_truth = self._load_ground_truth()
         logger.info(f"Loaded {len(self.ground_truth)} ground truth pairs")
         
-        # Step 1: Group record IDs by person hash (name string)
-        person_neighborhoods = {}
+        if len(self.ground_truth) == 0:
+            logger.error("No ground truth pairs found! Check ground truth file path.")
+            return {
+                'pairs_processed': 0,
+                'feature_vectors': 0,
+                'feature_count': len(self.feature_names),
+                'duration': 0.0
+            }
         
-        # Build neighborhoods from record_field_hashes
-        for record_id, fields in self.record_field_hashes.items():
-            if 'person' in fields and fields['person'] != 'NULL':
-                person_hash = fields['person']
-                if person_hash not in person_neighborhoods:
-                    person_neighborhoods[person_hash] = []
-                person_neighborhoods[person_hash].append(record_id)
-        
-        logger.info(f"Created {len(person_neighborhoods)} person name neighborhoods")
-        
-        # Step 2: Generate all pairs within each neighborhood
-        all_pairs = []
-        for person_hash, record_ids in person_neighborhoods.items():
-            # Only create pairs if multiple records share the same name
-            if len(record_ids) > 1:
-                for i in range(len(record_ids)):
-                    for j in range(i+1, len(record_ids)):
-                        all_pairs.append((record_ids[i], record_ids[j], person_hash))
-        
-        logger.info(f"Generated {len(all_pairs)} potential record pairs from neighborhoods")
-        
-        # Step 3: Match against ground truth and create feature vectors
+        # Initialize storage for feature vectors and labels
         feature_vectors = []
         labels = []
         processed_pairs = set()
         
-        for record1_id, record2_id, person_hash in all_pairs:
-            # Create both possible pair IDs
-            pair_id1 = f"{record1_id}|{record2_id}"
-            pair_id2 = f"{record2_id}|{record1_id}"
-            
-            # Skip if already processed
-            if pair_id1 in processed_pairs or pair_id2 in processed_pairs:
-                continue
-            
-            # Check if pair exists in ground truth
-            if pair_id1 in self.ground_truth:
-                pair_id = pair_id1
-                is_match = self.ground_truth[pair_id1]
-            elif pair_id2 in self.ground_truth:
-                pair_id = pair_id2
-                is_match = self.ground_truth[pair_id2]
-            else:
-                # Skip pairs not in ground truth
-                continue
-            
-            # Get field hashes for records
-            record1_fields = self.record_field_hashes.get(record1_id, {})
-            record2_fields = self.record_field_hashes.get(record2_id, {})
-            
-            # Skip if missing essential fields
-            if not record1_fields or not record2_fields:
-                continue
-            
-            # Create feature vector
-            feature_vector = self._construct_feature_vector(
-                record1_id, record2_id,
-                record1_fields, record2_fields,
-                self.unique_strings, None,
-                self.feature_names
-            )
-            
-            if feature_vector:
-                feature_vectors.append(feature_vector)
-                labels.append(1 if is_match else 0)
-                processed_pairs.add(pair_id)
+        # Connect to Weaviate for vector operations if needed
+        weaviate_client = None
+        if self.config['weaviate']['host'] and self.config['weaviate']['port']:
+            try:
+                import weaviate
+                weaviate_client = weaviate.connect_to_local(
+                    host=self.config['weaviate']['host'],
+                    port=self.config['weaviate']['port']
+                )
+                collection_name = self.config['weaviate']['collection_name']
+                collection = weaviate_client.collections.get(collection_name)
+                logger.info(f"Connected to Weaviate collection: {collection_name}")
+            except Exception as e:
+                logger.warning(f"Could not connect to Weaviate: {e}. Will proceed without vector operations.")
+                collection = None
+        else:
+            collection = None
         
-        logger.info(f"Matched {len(processed_pairs)} pairs against ground truth")
+        # Track progress
+        start_time = time.time()
+        logger.info(f"Starting feature engineering on {len(self.ground_truth)} ground truth pairs")
         
+        # Process each pair in the ground truth file
+        for pair_id, is_match in tqdm(self.ground_truth.items(), desc="Processing ground truth pairs"):
+            try:
+                # Split pair ID to get record IDs
+                record_ids = pair_id.split('|')
+                if len(record_ids) != 2:
+                    logger.warning(f"Invalid pair ID format: {pair_id}")
+                    continue
+                
+                record1_id, record2_id = record_ids
+                
+                # Get field hashes for records
+                record1_fields = self.record_field_hashes.get(record1_id, {})
+                record2_fields = self.record_field_hashes.get(record2_id, {})
+                
+                # Skip if missing essential fields
+                if not record1_fields or not record2_fields:
+                    logger.warning(f"Missing field data for pair {pair_id}")
+                    continue
+                
+                # Construct feature vector
+                feature_vector = self._construct_feature_vector(
+                    record1_id, record2_id,
+                    record1_fields, record2_fields,
+                    self.unique_strings, collection,
+                    self.feature_names
+                )
+                
+                if feature_vector:
+                    feature_vectors.append(feature_vector)
+                    labels.append(1 if is_match else 0)
+                    processed_pairs.add(pair_id)
+                else:
+                    logger.warning(f"Could not construct feature vector for pair {pair_id}")
+            
+            except Exception as e:
+                logger.error(f"Error processing pair {pair_id}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        # Check if we generated any feature vectors
+        if len(feature_vectors) == 0:
+            logger.error("No feature vectors generated! Check ground truth and record data.")
+            return {
+                'pairs_processed': 0,
+                'feature_vectors': 0,
+                'feature_count': len(self.feature_names),
+                'duration': time.time() - start_time
+            }
+        
+        # Run diagnostic check on generated features
         self._diagnostic_feature_check(feature_vectors)
-
+        
         # Save results
         output_dir = Path(self.config['system']['output_dir'])
         
@@ -226,7 +255,7 @@ class FeatureEngineer:
         with open(output_dir / "feature_names.json", 'w') as f:
             json.dump(self.feature_names, f)
         
-        # Save feature vectors and labels
+        # Save feature vectors and labels as numpy arrays
         feature_vectors_np = np.array(feature_vectors)
         labels_np = np.array(labels)
         
@@ -235,19 +264,38 @@ class FeatureEngineer:
         
         # Save a reference to memory-mapped files if using them
         if self.use_mmap:
+            # Save to memory-mapped files
+            np.save(self.mmap_dir / "feature_vectors.npy", feature_vectors_np)
+            np.save(self.mmap_dir / "labels.npy", labels_np)
+            
             with open(output_dir / "feature_vectors_info.json", 'w') as f:
                 json.dump({
                     'count': len(feature_vectors),
                     'feature_count': len(self.feature_names),
-                    'feature_vectors_file': str(self.feature_vectors_file),
-                    'labels_file': str(self.labels_file)
+                    'feature_vectors_file': str(self.mmap_dir / "feature_vectors.npy"),
+                    'labels_file': str(self.mmap_dir / "labels.npy")
                 }, f)
         
+        # Save processed pairs for reference
+        with open(output_dir / "processed_pairs.json", 'w') as f:
+            json.dump(list(processed_pairs), f)
+        
+        # Close Weaviate client if it was opened
+        if weaviate_client:
+            try:
+                weaviate_client.close()
+            except:
+                pass
+        
+        duration = time.time() - start_time
+        logger.info(f"Feature engineering completed: {len(processed_pairs)} pairs processed, "
+                f"{len(feature_vectors)} feature vectors, {duration:.2f} seconds")
+        
         return {
-            'pairs_processed': len(all_pairs),
+            'pairs_processed': len(processed_pairs),
             'feature_vectors': len(feature_vectors),
             'feature_count': len(self.feature_names),
-            'duration': 0.0
+            'duration': duration
         }
 
     def _load_unique_strings(self):
@@ -313,31 +361,130 @@ class FeatureEngineer:
             return {}
 
     def _load_ground_truth(self):
-        """Load ground truth data with proper format handling."""
+        """
+        Load ground truth data with enhanced error handling and diagnostics.
+        
+        Returns:
+            dict: Dictionary mapping pair keys to match status (True/False)
+        """
         try:
             ground_truth_file = Path(self.config['data']['ground_truth_file'])
             
             if not ground_truth_file.exists():
-                logger.warning("Ground truth file not found: %s", ground_truth_file)
+                logger.error(f"Ground truth file not found: {ground_truth_file}")
                 return {}
             
             ground_truth = {}
+            error_count = 0
             
             with open(ground_truth_file, 'r') as f:
-                reader = csv.reader(f)
-                next(reader, None)  # Skip header
+                # Try to detect file format
+                first_line = f.readline().strip()
+                f.seek(0)  # Reset file pointer
                 
-                for row in reader:
-                    if len(row) >= 3:
-                        left_id, right_id, match = row
-                        pair_key = f"{left_id}|{right_id}"
-                        ground_truth[pair_key] = match.lower() == 'true'
+                # Check if this is a CSV file with header
+                if first_line and ',' in first_line and any(header in first_line.lower() 
+                                                        for header in ['left', 'right', 'match']):
+                    logger.info(f"Detected CSV format with header for ground truth file")
+                    reader = csv.reader(f)
+                    next(reader, None)  # Skip header
+                    
+                    for row in reader:
+                        if len(row) >= 3:
+                            left_id, right_id, match = row
+                            
+                            # Ensure IDs are trimmed of any whitespace
+                            left_id = left_id.strip()
+                            right_id = right_id.strip()
+                            
+                            # Ensure consistent ordering of IDs
+                            if left_id > right_id:
+                                left_id, right_id = right_id, left_id
+                            
+                            # Normalize match value, handling various formats
+                            match_value = str(match).strip().lower()
+                            is_match = match_value in ['true', 'yes', 't', 'y', '1', 'match']
+                            
+                            pair_key = f"{left_id}|{right_id}"
+                            ground_truth[pair_key] = is_match
+                        else:
+                            error_count += 1
+                else:
+                    # Try alternate formats (JSON, etc.)
+                    try:
+                        # Check if it's a JSON file
+                        f.seek(0)  # Reset file pointer
+                        data = json.load(f)
+                        
+                        if isinstance(data, list):
+                            # List of pair objects
+                            for pair in data:
+                                if 'left' in pair and 'right' in pair and 'match' in pair:
+                                    left_id = str(pair['left']).strip()
+                                    right_id = str(pair['right']).strip()
+                                    
+                                    # Ensure consistent ordering
+                                    if left_id > right_id:
+                                        left_id, right_id = right_id, left_id
+                                    
+                                    pair_key = f"{left_id}|{right_id}"
+                                    ground_truth[pair_key] = bool(pair['match'])
+                        elif isinstance(data, dict):
+                            # Dictionary mapping pair keys to match status
+                            for pair_key, is_match in data.items():
+                                ids = pair_key.split('|')
+                                if len(ids) == 2:
+                                    left_id = ids[0].strip()
+                                    right_id = ids[1].strip()
+                                    
+                                    # Ensure consistent ordering
+                                    if left_id > right_id:
+                                        pair_key = f"{right_id}|{left_id}"
+                                    
+                                    ground_truth[pair_key] = bool(is_match)
+                    except json.JSONDecodeError:
+                        # Not a JSON file, try custom format parsing
+                        f.seek(0)  # Reset file pointer
+                        for line in f:
+                            parts = line.strip().split(',')
+                            if len(parts) >= 3:
+                                left_id = parts[0].strip()
+                                right_id = parts[1].strip()
+                                match = parts[2].strip().lower()
+                                
+                                # Ensure consistent ordering
+                                if left_id > right_id:
+                                    left_id, right_id = right_id, left_id
+                                
+                                pair_key = f"{left_id}|{right_id}"
+                                ground_truth[pair_key] = match in ['true', 'yes', 't', 'y', '1', 'match']
             
+            # Log statistics
             logger.info(f"Loaded {len(ground_truth)} ground truth pairs")
+            if error_count > 0:
+                logger.warning(f"Encountered {error_count} errors while parsing ground truth file")
+            
+            # Log match/non-match distribution
+            match_count = sum(1 for is_match in ground_truth.values() if is_match)
+            non_match_count = len(ground_truth) - match_count
+            match_percentage = (match_count / len(ground_truth) * 100) if ground_truth else 0
+            
+            logger.info(f"Ground truth distribution: {match_count} matches ({match_percentage:.1f}%), "
+                    f"{non_match_count} non-matches ({100 - match_percentage:.1f}%)")
+            
+            # Sample some entries for verification
+            if ground_truth:
+                sample_entries = list(ground_truth.items())[:5]
+                logger.info(f"Sample ground truth entries:")
+                for pair_key, is_match in sample_entries:
+                    logger.info(f"  {pair_key}: {is_match}")
+            
             return ground_truth
         
         except Exception as e:
-            logger.error(f"Error loading ground truth: {str(e)}")
+            logger.error(f"Error loading ground truth: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {}
 
     def _load_candidate_pairs(self):
@@ -774,38 +921,124 @@ class FeatureEngineer:
 
     def _diagnostic_feature_check(self, feature_vectors):
         """
-        Perform diagnostic checks on feature vectors to identify quality issues.
+        Perform comprehensive diagnostic checks on feature vectors to identify quality issues.
+        
+        Args:
+            feature_vectors (list): List of feature vectors to analyze
         """
         if not feature_vectors or len(feature_vectors) == 0:
             logger.warning("No feature vectors to analyze")
             return
         
+        num_vectors = len(feature_vectors)
         num_features = len(feature_vectors[0])
-        logger.info(f"Analyzing {len(feature_vectors)} feature vectors with {num_features} features")
+        logger.info(f"Analyzing {num_vectors} feature vectors with {num_features} features")
         
-        # Check for constant features
+        # 1. Check for constant features
         constant_features = []
+        constant_values = []
         for i in range(num_features):
-            values = set(vector[i] for vector in feature_vectors)
-            if len(values) <= 1:
+            first_value = feature_vectors[0][i]
+            if all(vector[i] == first_value for vector in feature_vectors):
                 constant_features.append(i)
+                constant_values.append(first_value)
         
         if constant_features:
             logger.warning(f"Found {len(constant_features)} constant features at indices: {constant_features}")
+            logger.warning(f"Constant values: {constant_values}")
             
             # If feature names are available, map indices to names
             if hasattr(self, 'feature_names') and len(self.feature_names) == num_features:
                 constant_feature_names = [self.feature_names[i] for i in constant_features]
                 logger.warning(f"Constant feature names: {constant_feature_names}")
         
-        # Check for NaN/inf values
+        # 2. Check for NaN/inf values
         nan_features = []
         for i in range(num_features):
-            if any(not np.isfinite(vector[i]) for vector in feature_vectors):
-                nan_features.append(i)
+            nan_count = sum(1 for vector in feature_vectors if not np.isfinite(vector[i]))
+            if nan_count > 0:
+                nan_features.append((i, nan_count))
         
         if nan_features:
-            logger.warning(f"Found {len(nan_features)} features with NaN/inf values at indices: {nan_features}")
+            logger.warning(f"Found {len(nan_features)} features with NaN/inf values:")
+            for idx, count in nan_features:
+                feature_name = self.feature_names[idx] if hasattr(self, 'feature_names') else f"Feature {idx}"
+                logger.warning(f"  {feature_name}: {count} NaN/inf values ({count/num_vectors*100:.1f}%)")
+        
+        # 3. Check feature value distributions
+        try:
+            # Convert to numpy array for efficient analysis
+            feature_arrays = np.array(feature_vectors)
+            
+            # Calculate basic statistics for each feature
+            min_values = feature_arrays.min(axis=0)
+            max_values = feature_arrays.max(axis=0)
+            mean_values = feature_arrays.mean(axis=0)
+            std_values = feature_arrays.std(axis=0)
+            
+            # Identify features with suspicious distributions
+            suspicious_features = []
+            for i in range(num_features):
+                if i not in constant_features:  # Skip features already identified as constant
+                    feature_min = min_values[i]
+                    feature_max = max_values[i]
+                    feature_mean = mean_values[i]
+                    feature_std = std_values[i]
+                    
+                    # Check for features with very low variance
+                    if feature_std < 0.01 and feature_max - feature_min < 0.1:
+                        feature_name = self.feature_names[i] if hasattr(self, 'feature_names') else f"Feature {i}"
+                        suspicious_features.append((feature_name, feature_min, feature_max, feature_mean, feature_std))
+            
+            if suspicious_features:
+                logger.warning(f"Found {len(suspicious_features)} features with suspicious distributions:")
+                for feature_name, min_val, max_val, mean_val, std_val in suspicious_features:
+                    logger.warning(f"  {feature_name}: min={min_val:.4f}, max={max_val:.4f}, "
+                                f"mean={mean_val:.4f}, std={std_val:.4f}")
+            
+            # 4. Check for correlations between features
+            if len(feature_vectors) > 10 and num_features > 1:
+                try:
+                    correlation_matrix = np.corrcoef(feature_arrays.T)
+                    
+                    # Find highly correlated feature pairs (ignoring self-correlations)
+                    highly_correlated = []
+                    for i in range(num_features):
+                        for j in range(i+1, num_features):
+                            if np.isfinite(correlation_matrix[i, j]) and abs(correlation_matrix[i, j]) > 0.95:
+                                feature1 = self.feature_names[i] if hasattr(self, 'feature_names') else f"Feature {i}"
+                                feature2 = self.feature_names[j] if hasattr(self, 'feature_names') else f"Feature {j}"
+                                highly_correlated.append((feature1, feature2, correlation_matrix[i, j]))
+                    
+                    if highly_correlated:
+                        logger.warning(f"Found {len(highly_correlated)} highly correlated feature pairs:")
+                        for feature1, feature2, corr in highly_correlated[:10]:  # Limit to 10 examples
+                            logger.warning(f"  {feature1} and {feature2}: correlation = {corr:.4f}")
+                except Exception as e:
+                    logger.warning(f"Could not compute feature correlations: {e}")
+        
+        except Exception as e:
+            logger.warning(f"Error in feature distribution analysis: {e}")
+        
+        # 5. Check for duplicate vectors
+        try:
+            # This is an approximate check for duplicate vectors
+            vector_strings = [str(v) for v in feature_vectors[:min(1000, len(feature_vectors))]]
+            unique_vectors = set(vector_strings)
+            duplicate_percent = (1 - len(unique_vectors) / len(vector_strings)) * 100
+            
+            if duplicate_percent > 10:
+                logger.warning(f"Approximately {duplicate_percent:.1f}% of feature vectors are duplicates "
+                            f"(based on sample of {len(vector_strings)} vectors)")
+        except Exception as e:
+            logger.warning(f"Error checking for duplicate vectors: {e}")
+        
+        # 6. Summary
+        logger.info("Feature vector diagnostic summary:")
+        logger.info(f"  Total vectors: {num_vectors}")
+        logger.info(f"  Features per vector: {num_features}")
+        logger.info(f"  Constant features: {len(constant_features)}")
+        logger.info(f"  Features with NaN/inf values: {len(nan_features)}")
 
     def _apply_prefilters(self, record1_id, record2_id, record1_fields, record2_fields, unique_strings):
         """
