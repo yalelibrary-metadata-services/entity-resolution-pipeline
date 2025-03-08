@@ -8,6 +8,7 @@ import csv
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+import time
 from concurrent.futures import ProcessPoolExecutor
 import pickle
 import weaviate

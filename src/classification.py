@@ -158,6 +158,12 @@ class Classifier:
         y_pred_proba = self.model.predict_proba(X_test_norm)[:, 1]
         y_pred = (y_pred_proba >= self.decision_threshold).astype(int)
         
+        output_dir = Path(self.config['system']['output_dir'])
+
+        # Save predictions and probabilities for reporting
+        np.save(output_dir / "predictions.npy", y_pred)
+        np.save(output_dir / "probabilities.npy", y_pred_proba)
+
         # Calculate metrics
         precision, recall, f1, _ = precision_recall_fscore_support(
             y_test, y_pred, average='binary'
@@ -440,6 +446,17 @@ class Classifier:
         # Save metrics
         with open(output_dir / "classification_metrics.json", 'w') as f:
             json.dump(self.metrics, f, indent=2)
+
+         # Add these lines to save predictions and probabilities
+        if hasattr(self, 'X_test') and hasattr(self, 'y_test'):
+            # Get predictions on test set
+            predictions, probabilities = self.batch_predict(self.X_test)
+            
+            # Save predictions and probabilities
+            np.save(output_dir / "predictions.npy", predictions)
+            np.save(output_dir / "probabilities.npy", probabilities)
+            
+            logger.info(f"Saved predictions and probabilities for {len(predictions)} test examples")
         
         # Save feature importance
         feature_importance = self._analyze_feature_importance()
