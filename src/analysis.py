@@ -217,17 +217,10 @@ class Analyzer:
 
     def _analyze_features(self, feature_vectors, labels, feature_names):
         """
-        Analyze feature distribution and correlation.
-        
-        Args:
-            feature_vectors (numpy.ndarray): Feature vectors
-            labels (numpy.ndarray): Labels
-            feature_names (list): Feature names
-            
-        Returns:
-            dict: Feature analysis results
+        Analyze feature distribution and correlation with improved handling of constant features.
         """
         if len(feature_vectors) == 0 or len(feature_names) == 0:
+            logger.warning("Cannot analyze features: Empty feature vectors or feature names")
             return {}
         
         # Create DataFrame for analysis
@@ -235,23 +228,54 @@ class Analyzer:
         if len(labels) == len(feature_vectors):
             df['label'] = labels
         
+        # Check for constant features
+        constant_features = []
+        for feature in feature_names:
+            if df[feature].nunique() <= 1:
+                constant_features.append(feature)
+                logger.warning(f"Feature '{feature}' has zero variance (constant values)")
+        
         # Calculate feature statistics
         feature_stats = df.describe().to_dict()
         
-        # Calculate feature importance
+        # Calculate feature importance with safe handling
         feature_importance = {}
         if 'label' in df.columns:
             for feature in feature_names:
-                correlation = df[feature].corr(df['label'])
-                feature_importance[feature] = abs(correlation)
+                if feature in constant_features:
+                    feature_importance[feature] = 0  # Zero importance for constant features
+                else:
+                    try:
+                        correlation = df[feature].corr(df['label'])
+                        feature_importance[feature] = abs(correlation if not pd.isna(correlation) else 0)
+                    except Exception:
+                        logger.warning(f"Could not calculate correlation for feature '{feature}'")
+                        feature_importance[feature] = 0
         
-        # Calculate feature correlation matrix
-        correlation_matrix = df[feature_names].corr().to_dict()
+        # Calculate correlation matrix safely
+        correlation_matrix = {}
+        non_constant_features = [f for f in feature_names if f not in constant_features]
         
-        # Find highly correlated features
+        if non_constant_features:
+            try:
+                # Use only non-constant features for correlation
+                corr_df = df[non_constant_features].corr().fillna(0)
+                correlation_matrix = corr_df.to_dict()
+                
+                # Add constant features back with zero correlations
+                for feature in constant_features:
+                    correlation_matrix[feature] = {f: 0 for f in feature_names}
+                    for f in feature_names:
+                        if f in correlation_matrix:
+                            correlation_matrix[f][feature] = 0
+                        
+            except Exception as e:
+                logger.error(f"Error calculating correlation matrix: {str(e)}")
+        
+        # Find highly correlated features (from non-constant features only)
         highly_correlated = []
-        for i, feature1 in enumerate(feature_names):
-            for feature2 in feature_names[i+1:]:
+        for i, feature1 in enumerate(non_constant_features):
+            for feature2 in non_constant_features[i+1:]:
                 if feature1 in correlation_matrix and feature2 in correlation_matrix[feature1]:
                     correlation = correlation_matrix[feature1][feature2]
                     if abs(correlation) > 0.8:
@@ -264,7 +288,8 @@ class Analyzer:
         return {
             'feature_stats': feature_stats,
             'feature_importance': feature_importance,
-            'highly_correlated': highly_correlated
+            'highly_correlated': highly_correlated,
+            'constant_features': constant_features
         }
 
     def _analyze_classification(self, metrics):

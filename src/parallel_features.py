@@ -217,6 +217,8 @@ class FeatureEngineer:
         
         logger.info(f"Matched {len(processed_pairs)} pairs against ground truth")
         
+        self._diagnostic_feature_check(feature_vectors)
+
         # Save results
         output_dir = Path(self.config['system']['output_dir'])
         
@@ -770,6 +772,41 @@ class FeatureEngineer:
         
         return matching_records
 
+    def _diagnostic_feature_check(self, feature_vectors):
+        """
+        Perform diagnostic checks on feature vectors to identify quality issues.
+        """
+        if not feature_vectors or len(feature_vectors) == 0:
+            logger.warning("No feature vectors to analyze")
+            return
+        
+        num_features = len(feature_vectors[0])
+        logger.info(f"Analyzing {len(feature_vectors)} feature vectors with {num_features} features")
+        
+        # Check for constant features
+        constant_features = []
+        for i in range(num_features):
+            values = set(vector[i] for vector in feature_vectors)
+            if len(values) <= 1:
+                constant_features.append(i)
+        
+        if constant_features:
+            logger.warning(f"Found {len(constant_features)} constant features at indices: {constant_features}")
+            
+            # If feature names are available, map indices to names
+            if hasattr(self, 'feature_names') and len(self.feature_names) == num_features:
+                constant_feature_names = [self.feature_names[i] for i in constant_features]
+                logger.warning(f"Constant feature names: {constant_feature_names}")
+        
+        # Check for NaN/inf values
+        nan_features = []
+        for i in range(num_features):
+            if any(not np.isfinite(vector[i]) for vector in feature_vectors):
+                nan_features.append(i)
+        
+        if nan_features:
+            logger.warning(f"Found {len(nan_features)} features with NaN/inf values at indices: {nan_features}")
+
     def _apply_prefilters(self, record1_id, record2_id, record1_fields, record2_fields, unique_strings):
         """
         Apply prefilters to automatically classify candidate pairs.
@@ -843,9 +880,32 @@ class FeatureEngineer:
         """
         Construct feature vector for a record pair.
         """
+
+         # Use print statements instead of logger
+        print(f"DIRECT DEBUG: Constructing features for {record1_id} and {record2_id}")
+        print(f"DIRECT DEBUG: Person hashes: {record1_fields.get('person', 'NOT FOUND')}, {record2_fields.get('person', 'NOT FOUND')}")
+        
+        # Check the first 5 pairs only to avoid overwhelming output
+        static_counter = getattr(self, '_debug_counter', 0)
+        setattr(self, '_debug_counter', static_counter + 1)
+        if static_counter < 5:
+            # Rest of debug code with print statements
+            person1_hash = record1_fields.get('person', 'NOT FOUND')
+            person2_hash = record2_fields.get('person', 'NOT FOUND')
+            print(f"DIRECT DEBUG: Person1 in unique_strings: {person1_hash in unique_strings}")
+            print(f"DIRECT DEBUG: Person2 in unique_strings: {person2_hash in unique_strings}")
+            
+            if person1_hash != 'NOT FOUND' and person2_hash != 'NOT FOUND':
+                if person1_hash in unique_strings and person2_hash in unique_strings:
+                    print(f"DIRECT DEBUG: Person1 string: {unique_strings[person1_hash]}")
+                    print(f"DIRECT DEBUG: Person2 string: {unique_strings[person2_hash]}")
+                else:
+                    print(f"DIRECT DEBUG: Person hashes not found in unique_strings")
+
         # Initialize feature vector with zeros
         feature_vector = [0.0] * len(feature_names)
         feature_computed = [False] * len(feature_names)
+        
         
         # Compute string similarity features for person field
         field = 'person'

@@ -421,7 +421,7 @@ class QueryEngine:
                         hash_value, field_type, str(e))
             return None
 
-    def _find_similar_vectors(self, collection, query_vector, field_type, limit=100, threshold=0.7):
+    def _find_similar_vectors(self, collection, query_vector, field_type, limit=100, threshold=0.6):
         """
         Find similar vectors with proper serialization.
         """
@@ -648,7 +648,7 @@ def process_batch_worker(batch_dict, config, similarity_threshold):
             similar_results = collection.query.near_vector(
                 near_vector=person_vector,
                 filters=field_filter,
-                limit=100,
+                limit=200,
                 return_metadata=MetadataQuery(distance=True),
                 target_vector=['person'],
                 include_vector=False  # Avoid returning vectors to reduce size
