@@ -102,7 +102,7 @@ features:
   normalize_features: true
   
   # Recursive feature elimination
-  rfe_enabled: true
+  rfe_enabled: false
   rfe_step_size: 1
   rfe_cv_folds: 5
   
