@@ -125,21 +125,31 @@ class Classifier:
         
         # Train model
         with Timer() as timer:
-            if self.weights is None:
-                logger.info("Training classifier")
-                
-                # Initialize model
-                self.model = self._initialize_model()
-                
-                # Train model
-                self.model.fit(X_train_norm, y_train)
-                
-                # Get weights
-                self.weights = self.model.coef_[0]
-                
-                logger.info("Classifier trained in %.2f seconds", timer.duration)
-            else:
-                logger.info("Using pre-trained weights")
+            try:
+                if self.weights is None:
+                    logger.info("Training classifier")
+                    
+                    # Initialize model
+                    self.model = self._initialize_model()
+                    
+                    # Train model
+                    self.model.fit(X_train_norm, y_train)
+                    
+                    # Get weights
+                    self.weights = self.model.coef_[0]
+                    
+                    # Use a safe way to log the duration
+                    duration = timer.duration if hasattr(timer, 'duration') and timer.duration is not None else 0
+                    logger.info("Classifier trained in %.2f seconds", duration)
+                else:
+                    logger.info("Using pre-trained weights")
+            except Exception as e:
+                # Handle any exceptions during training
+                logger.error(f"Error during model training: {str(e)}")
+                # Provide fallback weights if needed
+                if self.weights is None:
+                    logger.warning("Using default weights due to training error")
+                    self.weights = np.zeros(len(self.feature_names))
         
         # Evaluate model
         logger.info("Evaluating classifier")

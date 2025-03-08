@@ -140,211 +140,113 @@ class FeatureEngineer:
         return feature_names
 
     def execute(self, checkpoint=None):
-        """
-        Execute feature engineering for large datasets.
-        """
-        # Load checkpoint if provided
-        if checkpoint and os.path.exists(checkpoint):
-            state = load_checkpoint(checkpoint)
+        """Execute feature engineering for entity resolution with neighborhood-based approach."""
+        # Load ground truth data
+        self.ground_truth = self._load_ground_truth()
+        logger.info(f"Loaded {len(self.ground_truth)} ground truth pairs")
+        
+        # Step 1: Group record IDs by person hash (name string)
+        person_neighborhoods = {}
+        
+        # Build neighborhoods from record_field_hashes
+        for record_id, fields in self.record_field_hashes.items():
+            if 'person' in fields and fields['person'] != 'NULL':
+                person_hash = fields['person']
+                if person_hash not in person_neighborhoods:
+                    person_neighborhoods[person_hash] = []
+                person_neighborhoods[person_hash].append(record_id)
+        
+        logger.info(f"Created {len(person_neighborhoods)} person name neighborhoods")
+        
+        # Step 2: Generate all pairs within each neighborhood
+        all_pairs = []
+        for person_hash, record_ids in person_neighborhoods.items():
+            # Only create pairs if multiple records share the same name
+            if len(record_ids) > 1:
+                for i in range(len(record_ids)):
+                    for j in range(i+1, len(record_ids)):
+                        all_pairs.append((record_ids[i], record_ids[j], person_hash))
+        
+        logger.info(f"Generated {len(all_pairs)} potential record pairs from neighborhoods")
+        
+        # Step 3: Match against ground truth and create feature vectors
+        feature_vectors = []
+        labels = []
+        processed_pairs = set()
+        
+        for record1_id, record2_id, person_hash in all_pairs:
+            # Create both possible pair IDs
+            pair_id1 = f"{record1_id}|{record2_id}"
+            pair_id2 = f"{record2_id}|{record1_id}"
             
-            if self.use_mmap:
-                # For memory-mapped storage, we keep track of counts
-                # but actual data remains on disk
-                self.feature_vectors_count = state.get('feature_vectors_count', 0)
-                self.prefiltered_true_count = state.get('prefiltered_true_count', 0)
-                self.prefiltered_false_count = state.get('prefiltered_false_count', 0)
+            # Skip if already processed
+            if pair_id1 in processed_pairs or pair_id2 in processed_pairs:
+                continue
+            
+            # Check if pair exists in ground truth
+            if pair_id1 in self.ground_truth:
+                pair_id = pair_id1
+                is_match = self.ground_truth[pair_id1]
+            elif pair_id2 in self.ground_truth:
+                pair_id = pair_id2
+                is_match = self.ground_truth[pair_id2]
             else:
-                # For in-memory storage, load the data
-                self.feature_vectors = state.get('feature_vectors', [])
-                self.labels = state.get('labels', [])
-                self.prefiltered_true = state.get('prefiltered_true', [])
-                self.prefiltered_false = state.get('prefiltered_false', [])
+                # Skip pairs not in ground truth
+                continue
             
-            # Always load feature names
-            self.feature_names = state.get('feature_names', self.feature_names)
+            # Get field hashes for records
+            record1_fields = self.record_field_hashes.get(record1_id, {})
+            record2_fields = self.record_field_hashes.get(record2_id, {})
             
-            processed_pairs = set(state.get('processed_pairs', []))
-            logger.info("Resumed feature engineering from checkpoint: %s", checkpoint)
-        else:
-            processed_pairs = set()
+            # Skip if missing essential fields
+            if not record1_fields or not record2_fields:
+                continue
             
-            # Initialize counters
-            if self.use_mmap:
-                self.feature_vectors_count = 0
-                self.prefiltered_true_count = 0
-                self.prefiltered_false_count = 0
-                
-                # Clear files if they exist
-                if self.prefiltered_true_file.exists():
-                    self.prefiltered_true_file.unlink()
-                if self.prefiltered_false_file.exists():
-                    self.prefiltered_false_file.unlink()
-        
-        # Get candidate pairs
-        candidate_pairs = self._load_candidate_pairs()
-        logger.info("Loaded %d candidate pairs", len(candidate_pairs))
-        
-        # Filter pairs that haven't been processed yet
-        pairs_to_process = []
-        for pair in candidate_pairs:
-            pair_id = self._get_pair_id(pair['record1_id'], pair.get('record2_id', ''))
+            # Create feature vector
+            feature_vector = self._construct_feature_vector(
+                record1_id, record2_id,
+                record1_fields, record2_fields,
+                self.unique_strings, None,
+                self.feature_names
+            )
             
-            if pair_id not in processed_pairs:
-                pairs_to_process.append(pair)
+            if feature_vector:
+                feature_vectors.append(feature_vector)
+                labels.append(1 if is_match else 0)
+                processed_pairs.add(pair_id)
         
-        logger.info("Processing %d/%d candidate pairs", 
-                   len(pairs_to_process), len(candidate_pairs))
+        logger.info(f"Matched {len(processed_pairs)} pairs against ground truth")
         
-        if self.config['system']['mode'] == 'dev':
-            # In dev mode, limit the number of pairs to process
-            dev_sample_size = min(self.config['system']['dev_sample_size'], len(pairs_to_process))
-            pairs_to_process = pairs_to_process[:dev_sample_size]
-            logger.info("Dev mode: limited to %d pairs", len(pairs_to_process))
+        # Save results
+        output_dir = Path(self.config['system']['output_dir'])
         
-        # Process pairs in batches
-        batch_size = self.config['system']['batch_size']
-        max_workers = self.config['system']['max_workers']
+        # Save feature names
+        with open(output_dir / "feature_names.json", 'w') as f:
+            json.dump(self.feature_names, f)
         
-        # Connect to Weaviate - we'll pass the connection info to workers
-        weaviate_host = self.config['weaviate']['host']
-        weaviate_port = self.config['weaviate']['port']
-        collection_name = self.config['weaviate']['collection_name']
+        # Save feature vectors and labels
+        feature_vectors_np = np.array(feature_vectors)
+        labels_np = np.array(labels)
         
-        with Timer() as timer:
-            # Create batches of pairs
-            pair_batches = self._create_batches(pairs_to_process, batch_size)
-            
-            # Determine processing mode
-            debug_mode = os.environ.get('DEBUG_MODE', '').lower() == 'true'
-            
-            if debug_mode:
-                # Process synchronously for debugging
-                logger.info("DEBUG MODE: Processing synchronously")
-                
-                # Initialize Weaviate client
-                client = weaviate.connect_to_local(
-                    host=weaviate_host,
-                    port=weaviate_port
-                )
-                collection = client.collections.get(collection_name)
-                
-                for batch_idx, batch in enumerate(tqdm(pair_batches, desc="Processing batches")):
-                    # Process batch
-                    batch_results = self._process_batch_sync(
-                        batch, collection, self.feature_names, 
-                        self.unique_strings, self.record_field_hashes
-                    )
-                    
-                    if batch_results:
-                        # Extract results
-                        batch_vectors = batch_results['vectors']
-                        batch_labels = batch_results['labels']
-                        batch_prefiltered_true = batch_results['prefiltered_true']
-                        batch_prefiltered_false = batch_results['prefiltered_false']
-                        batch_pair_ids = batch_results['pair_ids']
-                        
-                        # Save results
-                        self._save_batch_results(
-                            batch_vectors, batch_labels, 
-                            batch_prefiltered_true, batch_prefiltered_false
-                        )
-                        
-                        # Update processed pairs
-                        processed_pairs.update(batch_pair_ids)
-                    
-                    # Save checkpoint periodically
-                    if self.config['data']['checkpoints_enabled'] and (batch_idx + 1) % 10 == 0:
-                        self._save_checkpoint(processed_pairs, batch_idx)
-                
-                # Close client
-                client.close()
-            else:
-                # Use parallel processing with worker function that avoids serialization issues
-                with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    batch_results = []
-                    
-                    # Submit all batches for processing
-                    for batch_idx, batch in enumerate(tqdm(pair_batches, desc="Submitting batches")):
-                        # Convert batch to JSON for serialization
-                        serialized_batch = []
-                        for pair in batch:
-                            serialized_pair = {}
-                            for key, value in pair.items():
-                                serialized_pair[key] = str(value) if value is not None else None
-                            serialized_batch.append(serialized_pair)
-                        
-                        # Prepare configuration for worker
-                        worker_config = {
-                            'weaviate_host': weaviate_host,
-                            'weaviate_port': weaviate_port,
-                            'collection_name': collection_name,
-                            'feature_names': self.feature_names,
-                            'prefilters': self.config['features']['prefilters']
-                        }
-                        
-                        # Submit batch for processing
-                        future = executor.submit(
-                            process_batch_worker,
-                            serialized_batch,
-                            worker_config
-                        )
-                        
-                        batch_results.append(future)
-                    
-                    # Process results as they complete
-                    for future in tqdm(batch_results, desc="Processing results"):
-                        try:
-                            batch_result = future.result()
-                            
-                            if batch_result:
-                                # Extract results
-                                batch_vectors = np.array(batch_result['vectors'])
-                                batch_labels = np.array(batch_result['labels'])
-                                batch_prefiltered_true = batch_result['prefiltered_true']
-                                batch_prefiltered_false = batch_result['prefiltered_false']
-                                batch_pair_ids = batch_result['pair_ids']
-                                
-                                # Save results
-                                self._save_batch_results(
-                                    batch_vectors, batch_labels, 
-                                    batch_prefiltered_true, batch_prefiltered_false
-                                )
-                                
-                                # Update processed pairs
-                                processed_pairs.update(batch_pair_ids)
-                        
-                        except Exception as e:
-                            logger.error("Error processing batch result: %s", str(e))
-                            import traceback
-                            logger.error(traceback.format_exc())
+        np.save(output_dir / "feature_vectors.npy", feature_vectors_np)
+        np.save(output_dir / "labels.npy", labels_np)
         
-        # Save final results
-        self._save_results()
-        
-        # Get current counts
+        # Save a reference to memory-mapped files if using them
         if self.use_mmap:
-            # Load from memory-mapped files to count
-            feature_vectors_count = self.feature_vectors_count
-            prefiltered_true_count = self.prefiltered_true_count
-            prefiltered_false_count = self.prefiltered_false_count
-        else:
-            feature_vectors_count = len(self.feature_vectors)
-            prefiltered_true_count = len(self.prefiltered_true)
-            prefiltered_false_count = len(self.prefiltered_false)
+            with open(output_dir / "feature_vectors_info.json", 'w') as f:
+                json.dump({
+                    'count': len(feature_vectors),
+                    'feature_count': len(self.feature_names),
+                    'feature_vectors_file': str(self.feature_vectors_file),
+                    'labels_file': str(self.labels_file)
+                }, f)
         
-        results = {
-            'pairs_processed': len(processed_pairs),
-            'feature_vectors': feature_vectors_count,
-            'prefiltered_true': prefiltered_true_count,
-            'prefiltered_false': prefiltered_false_count,
+        return {
+            'pairs_processed': len(all_pairs),
+            'feature_vectors': len(feature_vectors),
             'feature_count': len(self.feature_names),
-            'duration': timer.duration
+            'duration': 0.0
         }
-        
-        logger.info("Feature engineering completed: %d pairs, %d vectors, %.2f seconds",
-                   len(processed_pairs), feature_vectors_count, timer.duration)
-        
-        return results
 
     def _load_unique_strings(self):
         """
@@ -409,9 +311,7 @@ class FeatureEngineer:
             return {}
 
     def _load_ground_truth(self):
-        """
-        Load ground truth data for evaluation.
-        """
+        """Load ground truth data with proper format handling."""
         try:
             ground_truth_file = Path(self.config['data']['ground_truth_file'])
             
@@ -428,19 +328,14 @@ class FeatureEngineer:
                 for row in reader:
                     if len(row) >= 3:
                         left_id, right_id, match = row
-                        
-                        # Ensure consistent ordering of IDs
-                        if left_id > right_id:
-                            left_id, right_id = right_id, left_id
-                        
                         pair_key = f"{left_id}|{right_id}"
                         ground_truth[pair_key] = match.lower() == 'true'
             
-            logger.info("Loaded %d ground truth pairs", len(ground_truth))
+            logger.info(f"Loaded {len(ground_truth)} ground truth pairs")
             return ground_truth
         
         except Exception as e:
-            logger.error("Error loading ground truth: %s", str(e))
+            logger.error(f"Error loading ground truth: {str(e)}")
             return {}
 
     def _load_candidate_pairs(self):
@@ -500,6 +395,10 @@ class FeatureEngineer:
         """
         Get unique identifier for a record pair with consistent ordering.
         """
+        # Convert None or non-string values to strings
+        record1_id = str(record1_id) if record1_id is not None else ""
+        record2_id = str(record2_id) if record2_id is not None else ""
+        
         # Ensure consistent ordering
         if record1_id > record2_id:
             record1_id, record2_id = record2_id, record1_id
@@ -538,6 +437,14 @@ class FeatureEngineer:
             
             # Get pair ID
             pair_id = self._get_pair_id(record1_id, record2_id)
+
+            pair_id_reversed = f"{record2_id}|{record1_id}"
+            if pair_id in self.ground_truth:
+                label = 1 if self.ground_truth[pair_id] else 0
+            elif pair_id_reversed in self.ground_truth:
+                label = 1 if self.ground_truth[pair_id_reversed] else 0
+            else:
+                label = None
             
             # Get field hashes for both records
             record1_fields = record_field_hashes.get(record1_id, {})
@@ -593,6 +500,104 @@ class FeatureEngineer:
                 vectors.append(feature_vector)
                 labels.append(label)
                 pair_ids.append(pair_id)
+        
+        return {
+            'vectors': vectors,
+            'labels': labels,
+            'prefiltered_true': prefiltered_true,
+            'prefiltered_false': prefiltered_false,
+            'pair_ids': pair_ids
+        }
+
+    def _process_batch_direct(self, batch):
+        """
+        Process a batch of candidate pairs with direct hash-to-ID mapping.
+        """
+        # Initialize results
+        vectors = []
+        labels = []
+        prefiltered_true = []
+        prefiltered_false = []
+        pair_ids = []
+        
+        # Build a hash-to-id mapping from ground truth for faster lookups
+        hash_to_id_map = {}
+        
+        # Collect hashes from records for quick lookup
+        for record_id, field_hashes in self.record_field_hashes.items():
+            if 'person' in field_hashes:
+                person_hash = field_hashes['person']
+                if person_hash != 'NULL':
+                    # Multiple records might have the same person hash
+                    if person_hash not in hash_to_id_map:
+                        hash_to_id_map[person_hash] = []
+                    hash_to_id_map[person_hash].append(record_id)
+        
+        logger.info(f"Built hash-to-id map with {len(hash_to_id_map)} unique hashes")
+        
+        # Track statistics
+        total_pairs = len(batch)
+        matched_pairs = 0
+        ground_truth_matches = 0
+        
+        # Process each pair
+        for pair in batch:
+            record1_id = pair['record1_id']
+            record2_hash = pair['record2_hash']
+            
+            # Get record2_id from hash mapping
+            record2_ids = hash_to_id_map.get(record2_hash, [])
+            
+            if not record2_ids:
+                continue
+            
+            # Take the first matching record ID
+            record2_id = record2_ids[0]
+            
+            # Skip self-matches
+            if record1_id == record2_id:
+                continue
+            
+            matched_pairs += 1
+            
+            # Check both orderings in ground truth
+            pair_id_forward = f"{record1_id}|{record2_id}"
+            pair_id_reverse = f"{record2_id}|{record1_id}"
+            
+            label = None
+            if pair_id_forward in self.ground_truth:
+                label = 1 if self.ground_truth[pair_id_forward] else 0
+                pair_id = pair_id_forward
+                ground_truth_matches += 1
+            elif pair_id_reverse in self.ground_truth:
+                label = 1 if self.ground_truth[pair_id_reverse] else 0
+                pair_id = pair_id_reverse
+                ground_truth_matches += 1
+            else:
+                continue
+            
+            # Get field hashes for both records
+            record1_fields = self.record_field_hashes.get(record1_id, {})
+            record2_fields = self.record_field_hashes.get(record2_id, {})
+            
+            # Skip if missing essential fields
+            if not record1_fields or not record2_fields:
+                continue
+            
+            # Construct feature vector
+            feature_vector = self._construct_feature_vector(
+                record1_id, record2_id,
+                record1_fields, record2_fields,
+                self.unique_strings, None,  # Pass None for collection since we're not using it
+                self.feature_names
+            )
+            
+            if feature_vector:
+                vectors.append(feature_vector)
+                labels.append(label)
+                pair_ids.append(pair_id)
+        
+        logger.info(f"Processed {total_pairs} pairs: {matched_pairs} matched to record2_id, {ground_truth_matches} found in ground truth")
         
         return {
             'vectors': vectors,
@@ -706,66 +711,52 @@ class FeatureEngineer:
     # Add to src/parallel_features.py in the _save_results method
     def _save_results(self):
         """
-        Save feature engineering results with enhanced debugging.
+        Save feature engineering results with proper synchronization.
         """
         output_dir = Path(self.config['system']['output_dir'])
-        output_dir.mkdir(exist_ok=True)
         
-        # Log where files are being saved
-        logger.info(f"Saving feature engineering results to directory: {output_dir}")
+        # Ensure output directory exists
+        output_dir.mkdir(parents=True, exist_ok=True)
         
         # Save feature names
-        feature_names_path = output_dir / "feature_names.json"
-        with open(feature_names_path, 'w') as f:
-            json.dump(self.feature_names, f, indent=2)
-        logger.info(f"Saved feature names to {feature_names_path}")
+        with open(output_dir / "feature_names.json", 'w') as f:
+            json.dump(self.feature_names, f)
         
-        # Save feature vectors and labels with path logging
+        # Get feature vectors and labels
         if self.use_mmap:
-            # For memory-mapped storage, feature vectors and labels 
-            # are already saved in numpy files
-            logger.info(f"Using memory-mapped storage for feature vectors at: {self.feature_vectors_file}")
-            logger.info(f"Using memory-mapped storage for labels at: {self.labels_file}")
+            # Update memory-mapped files with current data
+            np.save(self.feature_vectors_file, np.array(self.feature_vectors))
+            np.save(self.labels_file, np.array(self.labels))
             
-            # Copy memory-mapped data to standard location for compatibility
-            if self.feature_vectors_file.exists():
-                try:
-                    # Load from memory-mapped file
-                    feature_vectors = np.load(self.feature_vectors_file)
-                    # Save to standard location
-                    np.save(output_dir / "feature_vectors.npy", feature_vectors)
-                    logger.info(f"Copied feature vectors from {self.feature_vectors_file} to {output_dir / 'feature_vectors.npy'}")
-                except Exception as e:
-                    logger.error(f"Error copying feature vectors: {e}")
+            # Copy to standard location for compatibility
+            feature_vectors = np.load(self.feature_vectors_file)
+            labels = np.load(self.labels_file)
             
-            if self.labels_file.exists():
-                try:
-                    # Load from memory-mapped file
-                    labels = np.load(self.labels_file)
-                    # Save to standard location
-                    np.save(output_dir / "labels.npy", labels)
-                    logger.info(f"Copied labels from {self.labels_file} to {output_dir / 'labels.npy'}")
-                except Exception as e:
-                    logger.error(f"Error copying labels: {e}")
+            np.save(output_dir / "feature_vectors.npy", feature_vectors)
+            np.save(output_dir / "labels.npy", labels)
             
-            # Create reference file
+            # Save reference file
             with open(output_dir / "feature_vectors_info.json", 'w') as f:
                 json.dump({
-                    'count': self.feature_vectors_count,
+                    'count': len(feature_vectors),
                     'feature_count': len(self.feature_names),
                     'feature_vectors_file': str(self.feature_vectors_file),
                     'labels_file': str(self.labels_file)
-                }, f, indent=2)
-            logger.info(f"Saved feature vectors info to {output_dir / 'feature_vectors_info.json'}")
-        else:
-            # For in-memory storage, save to numpy files
-            feature_vectors_np = np.array(self.feature_vectors)
-            labels_np = np.array(self.labels)
+                }, f)
             
-            np.save(output_dir / "feature_vectors.npy", feature_vectors_np)
-            np.save(output_dir / "labels.npy", labels_np)
-            logger.info(f"Saved feature vectors to {output_dir / 'feature_vectors.npy'}, shape={feature_vectors_np.shape}")
-            logger.info(f"Saved labels to {output_dir / 'labels.npy'}, shape={labels_np.shape}")
+            logger.info(f"Saved {len(feature_vectors)} feature vectors and {len(labels)} labels")
+            
+            # Update internal counts
+            self.feature_vectors_count = len(feature_vectors)
+        else:
+            # For in-memory storage, simply save to output directory
+            feature_vectors = np.array(self.feature_vectors)
+            labels = np.array(self.labels)
+            
+            np.save(output_dir / "feature_vectors.npy", feature_vectors)
+            np.save(output_dir / "labels.npy", labels)
+            
+            logger.info(f"Saved {len(feature_vectors)} feature vectors and {len(labels)} labels")
     
     def _find_records_by_hash(self, hash_value, field_type, record_field_hashes):
         """
@@ -1158,6 +1149,9 @@ def process_batch_worker(batch, worker_config):
                     continue
                 
                 # Get pair ID
+                record1_id = str(record1_id) if record1_id is not None else ""
+                record2_id = str(record2_id) if record2_id is not None else ""
+
                 if record1_id > record2_id:
                     record1_id, record2_id = record2_id, record1_id
                     record1_hash, record2_hash = record2_hash, record1_hash

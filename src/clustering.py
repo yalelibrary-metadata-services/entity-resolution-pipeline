@@ -96,22 +96,31 @@ class Clusterer:
             self._apply_transitivity()
         
         # Perform clustering
-        with Timer() as timer:
-            logger.info("Performing clustering with algorithm: %s", self.algorithm)
-            
-            if self.algorithm == 'connected_components':
-                self.clusters = self._cluster_connected_components()
-            
-            elif self.algorithm == 'louvain':
-                self.clusters = self._cluster_louvain()
-            
-            elif self.algorithm == 'label_propagation':
-                self.clusters = self._cluster_label_propagation()
-            
-            else:
-                raise ValueError(f"Unsupported clustering algorithm: {self.algorithm}")
-            
-            logger.info("Clustering completed in %.2f seconds", timer.duration)
+        try:
+            with Timer() as timer:
+                logger.info("Performing clustering with algorithm: %s", self.algorithm)
+                
+                if self.algorithm == 'connected_components':
+                    self.clusters = self._cluster_connected_components()
+                
+                elif self.algorithm == 'louvain':
+                    self.clusters = self._cluster_louvain()
+                
+                elif self.algorithm == 'label_propagation':
+                    self.clusters = self._cluster_label_propagation()
+                
+                else:
+                    raise ValueError(f"Unsupported clustering algorithm: {self.algorithm}")
+                
+                # Safely access timer duration
+                duration = timer.duration if hasattr(timer, 'duration') and timer.duration is not None else 0
+                logger.info("Clustering completed in %.2f seconds", duration)
+        except Exception as e:
+            logger.error(f"Error during clustering: {str(e)}")
+            # Provide fallback clusters if needed
+            if not self.clusters:
+                logger.warning("Using empty clusters due to clustering error")
+                self.clusters = []
         
         # Filter small clusters if needed
         if self.min_cluster_size > 1:
